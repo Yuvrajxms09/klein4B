@@ -1,67 +1,29 @@
-# FLUX.2 Klein 4B — baseline inference
+# FLUX.2 Klein 4B
 
-Minimal pipeline and inference for `black-forest-labs/FLUX.2-klein-4B`: load, T2I, I2I. No server, no compile, no warmup. Add optimizations on top as needed.
+Inference pipeline for `black-forest-labs/FLUX.2-klein-4B`: T2I and I2I via diffusers-style API. 4-step distilled; default `num_inference_steps=4`.
 
-## Usage
+## What it does
 
-```python
-from pipeline import load_pipeline, run_t2i, run_i2i
-from PIL import Image
+- **`klein_pipeline.py`** – `Flux2KleinPipeline`: load model, `pipe(prompt=..., image=..., height=..., width=...)` for T2I or I2I.
+- **`taef2_vae.py`** – Optional TAEF2 lightweight VAE: `replace_pipeline_vae_with_taef2(pipe)` after load. Same latent API; faster encode/decode. Weights from [madebyollin/taef2](https://huggingface.co/madebyollin/taef2).
+- **`cache_dit_klein.py`** – Optional cache-DiT and runtime opts: `enable_cache_dit(pipe)`, `apply_attention_backend(pipe, ...)`, `apply_transformer_compile(pipe)`.
 
-pipe = load_pipeline()
+## Optimizations in place
 
-# T2I
-img = run_t2i(pipe, "A capybara under a banana leaf", seed=0)
-img.save("out.png")
+| Component | What’s done |
+|-----------|--------------|
+| Pipeline | `cache_context("cond")` / `("uncond")` in denoise loop; `refresh_context` before each run when cache-dit is enabled. |
+| Denoise loop | `torch.compiler.cudagraph_mark_step_begin()` at each step when available. |
+| Defaults | 4 steps, no progress bar change (call `pipe.set_progress_bar_config(disable=True)` in notebook if desired). |
 
-# I2I
-ref = Image.open("out.png").convert("RGB")
-img = run_i2i(pipe, "make it night time", ref, seed=1)
-img.save("edit.png")
-```
+## Optional (call after load)
 
-## Optional: lighter VAE (TAEF2)
-
-To use the TAEF2 lightweight VAE (faster encode/decode, same latent interface), load the pipeline then swap the VAE:
-
-```python
-from klein_pipeline import Flux2KleinPipeline
-from taef2_vae import replace_pipeline_vae_with_taef2
-import torch
-
-pipe = Flux2KleinPipeline.from_pretrained("black-forest-labs/FLUX.2-klein-4B", torch_dtype=torch.bfloat16)
-pipe.to("cuda")
-replace_pipeline_vae_with_taef2(pipe)  # optional: cache_dir=".cache/taef2"
-# then use pipe as usual for T2I / I2I
-```
-
-First run downloads `taesd.py` (from taesd repo) and `taef2.safetensors` (from [madebyollin/taef2](https://huggingface.co/madebyollin/taef2)) into `cache_dir` (default `.cache/taef2`).
-
-## Optional: cache-DiT (faster transformer steps)
-
-Klein 4B is a 4-step distilled model. To enable DBCache (cache conditioning across steps), call `enable_cache_dit(pipe)` after loading. The pipeline will then call `refresh_context` before each run. Defaults match **flux-stream-editor** (FastFlux2Config): `cache_fn=1`, `cache_bn=0`, `residual_diff_threshold=0.8`, `single_block_rdt_scale=3.0`, `max_warmup_steps=0`; `steps_mask` is `"10"` for 2 steps else `"1"*num_inference_steps` (so `"1111"` for 4 steps).
-
-```python
-from klein_pipeline import Flux2KleinPipeline
-from cache_dit_klein import enable_cache_dit
-import torch
-
-pipe = Flux2KleinPipeline.from_pretrained("black-forest-labs/FLUX.2-klein-4B", torch_dtype=torch.bfloat16)
-pipe.to("cuda")
-enable_cache_dit(pipe)  # optional: num_inference_steps=4, steps_mask=None (uses "1111" for 4 steps)
-# then pipe(...) as usual; num_inference_steps=4 by default
-```
-
-Requires `pip install cache-dit`.
-
-**Other optimizations** (in `cache_dit_klein`, all independent; use any subset):
-
-- **Attention backend** – `apply_attention_backend(pipe, "sage")` (or `"native"`, `"fa3"` / `"_flash_3"`, or `"auto"` to try flash3 → sage → native). Installing flash-attn/sage is not enough; you must call this. No dependency on cache-dit or compile.
-- **Transformer compile** – `apply_transformer_compile(pipe)`. Works without cache-dit; if cache-dit is enabled, call it after `enable_cache_dit` so compile and cache interoperate. First run after compile is slow (warmup).
-- **cudagraph_mark_step_begin** – Already used in the pipeline denoise loop when available.
+- **TAEF2** – `replace_pipeline_vae_with_taef2(pipe)`. Requires first-run download of `taesd.py` and `taef2.safetensors` into `.cache/taef2` (or set `cache_dir`).
+- **Cache-DiT** – `enable_cache_dit(pipe)`. Requires `pip install cache-dit`. Defaults match flux-stream-editor (4-step: steps_mask `"1111"`).
+- **Attention backend** – `apply_attention_backend(pipe, "sage" \| "native" \| "fa3" \| "auto")`. Must be called; installing flash/sage alone is not enough.
+- **Transformer compile** – `apply_transformer_compile(pipe)`. First run after this is slow (warmup). With variable resolutions you may want to skip or warm fixed resolutions.
+- **Notebook-only** – `pipe.transformer.fuse_qkv_projections()`, `pipe.vae.fuse_qkv_projections()`, `pipe.vae.to(memory_format=torch.channels_last)`; TF32: `torch.backends.cuda.matmul.allow_tf32 = True`, `torch.backends.cudnn.allow_tf32 = True`.
 
 ## Dependencies
 
-See `requirements.txt`. Core: `torch`, `diffusers` (main), `transformers`, `accelerate`, `pillow`.
-
----
+See `requirements.txt`. Core: `torch`, `diffusers`, `transformers`, `accelerate`, `safetensors`, `pillow`. Optional: `cache-dit` for cache-DiT.
