@@ -1,0 +1,12 @@
+# FLUX.2 Klein 4B — baseline inference only
+torch>=2.6.0
+torchvision>=0.21.0
+diffusers @ git+https://github.com/huggingface/diffusers.git
+transformers>=4.51.0
+accelerate>=0.33.0
+safetensors>=0.4.0
+huggingface_hub>=0.25.0
+numpy>=1.26.0
+pillow>=10.0.0
+# Cache-DiT for faster transformer steps (optional but recommended)
+cache-dit>=0.3.0
