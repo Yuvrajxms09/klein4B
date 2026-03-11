@@ -54,6 +54,12 @@ enable_cache_dit(pipe)  # optional: num_inference_steps=4, steps_mask=None (uses
 
 Requires `pip install cache-dit`.
 
+**Other optimizations** (in `cache_dit_klein`, all independent; use any subset):
+
+- **Attention backend** – `apply_attention_backend(pipe, "sage")` (or `"native"`, `"fa3"` / `"_flash_3"`, or `"auto"` to try flash3 → sage → native). Installing flash-attn/sage is not enough; you must call this. No dependency on cache-dit or compile.
+- **Transformer compile** – `apply_transformer_compile(pipe)`. Works without cache-dit; if cache-dit is enabled, call it after `enable_cache_dit` so compile and cache interoperate. First run after compile is slow (warmup).
+- **cudagraph_mark_step_begin** – Already used in the pipeline denoise loop when available.
+
 ## Dependencies
 
 See `requirements.txt`. Core: `torch`, `diffusers` (main), `transformers`, `accelerate`, `pillow`.
