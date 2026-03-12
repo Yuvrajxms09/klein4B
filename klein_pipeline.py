@@ -219,6 +219,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._cache_image_latent_ids: bool = True
         self._cache_prompt: bool = True
 
+        # Optional torch.compile wrappers (set by enable_compile())
+        self._vae_encode_fn: Callable | None = None
+        self._vae_decode_fn: Callable | None = None
+
     @staticmethod
     def _get_qwen3_prompt_embeds(
         text_encoder: Qwen3ForCausalLM,
@@ -578,7 +582,15 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         image_latents = []
         for image in images:
             image = image.to(device=device, dtype=dtype, non_blocking=non_blocking_h2d)
-            image_latent = self._encode_vae_image(image=image, generator=generator)
+            if self._vae_encode_fn is not None:
+                try:
+                    image_latent = self._vae_encode_fn(image=image, generator=generator)
+                except Exception:
+                    logger.warning("vae encoder compiled path failed, fallback to eager")
+                    self._vae_encode_fn = None
+                    image_latent = self._encode_vae_image(image=image, generator=generator)
+            else:
+                image_latent = self._encode_vae_image(image=image, generator=generator)
             image_latents.append(image_latent)  # (1, 128, 32, 32)
 
         latent_ids_key = tuple((latent.shape[2], latent.shape[3]) for latent in image_latents)
@@ -632,6 +644,75 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._timesteps_cache.clear()
         self._image_latent_ids_cache.clear()
         self._prompt_cache.clear()
+
+    def enable_compile(
+        self,
+        *,
+        compile_transformer: bool = True,
+        enable_vae_encoder_compile: bool = True,
+        enable_vae_decoder_compile: bool = True,
+        dynamic: bool = False,
+        compile_disable_cudagraphs: bool = True,
+        vae_encoder_compile_mode: str = "reduce-overhead",
+        vae_decoder_compile_mode: str = "reduce-overhead",
+        cache_size_limit: int | None = None,
+    ) -> None:
+        """
+        Enable torch.compile on transformer and/or VAE encode/decode. Call once after
+        loading the pipeline (e.g. after pipe.to("cuda")).
+        Set dynamic=True to compile with dynamic shapes (fewer recompiles for varying
+        resolutions); see PyTorch docs on recompilations.
+        """
+        if cache_size_limit is not None:
+            import torch._dynamo.config as dynamo_config
+            dynamo_config.cache_size_limit = cache_size_limit
+
+        base_compile_kwargs: dict[str, Any] = {"fullgraph": False}
+        if dynamic:
+            base_compile_kwargs["dynamic"] = True
+        if compile_disable_cudagraphs:
+            base_compile_kwargs["options"] = {"triton.cudagraphs": False}
+        else:
+            base_compile_kwargs["mode"] = "reduce-overhead"
+
+        if compile_transformer:
+            try:
+                self.transformer = torch.compile(self.transformer, **base_compile_kwargs)
+                logger.info("transformer compiled: %s", base_compile_kwargs)
+            except Exception as exc:
+                logger.warning("transformer compile fallback to eager: %r", exc)
+
+        def _encode_fn(image: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+            return self._encode_vae_image(image=image, generator=generator)
+
+        if enable_vae_encoder_compile:
+            enc_kwargs = dict(base_compile_kwargs)
+            if not compile_disable_cudagraphs:
+                enc_kwargs["mode"] = vae_encoder_compile_mode
+            try:
+                self._vae_encode_fn = torch.compile(_encode_fn, **enc_kwargs)
+                logger.info("vae encoder compiled: %s", enc_kwargs)
+            except Exception as exc:
+                self._vae_encode_fn = _encode_fn
+                logger.warning("vae encoder compile fallback to eager: %r", exc)
+        else:
+            self._vae_encode_fn = _encode_fn
+
+        def _decode_fn(latents: torch.Tensor) -> torch.Tensor:
+            return self.vae.decode(latents, return_dict=False)[0]
+
+        if enable_vae_decoder_compile:
+            dec_kwargs = dict(base_compile_kwargs)
+            if not compile_disable_cudagraphs:
+                dec_kwargs["mode"] = vae_decoder_compile_mode
+            try:
+                self._vae_decode_fn = torch.compile(_decode_fn, **dec_kwargs)
+                logger.info("vae decoder compiled: %s", dec_kwargs)
+            except Exception as exc:
+                self._vae_decode_fn = _decode_fn
+                logger.warning("vae decoder compile fallback to eager: %r", exc)
+        else:
+            self._vae_decode_fn = _decode_fn
 
     def check_inputs(
         self,
@@ -1010,7 +1091,15 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         if output_type == "latent":
             image = latents
         else:
-            image = self.vae.decode(latents, return_dict=False)[0]
+            if self._vae_decode_fn is not None:
+                try:
+                    image = self._vae_decode_fn(latents)
+                except Exception:
+                    logger.warning("vae decoder compiled path failed, fallback to eager")
+                    self._vae_decode_fn = None
+                    image = self.vae.decode(latents, return_dict=False)[0]
+            else:
+                image = self.vae.decode(latents, return_dict=False)[0]
             image = self.image_processor.postprocess(image, output_type=output_type)
 
         # Offload all models
