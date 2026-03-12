@@ -1,6 +1,6 @@
 # FLUX.2 Klein 4B
 
-Inference pipeline for `black-forest-labs/FLUX.2-klein-4B`: T2I and I2I via diffusers-style API. 4-step distilled; default `num_inference_steps=4`.
+Inference pipeline for `black-forest-labs/FLUX.2-klein-4B`: T2I and I2I via 4-step distilled model
 
 ## Optimizations in place
 
