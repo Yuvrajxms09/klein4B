@@ -13,6 +13,12 @@ Inference pipeline for `black-forest-labs/FLUX.2-klein-4B`: T2I and I2I via diff
 | Component | What’s done |
 |-----------|--------------|
 | Pipeline | `cache_context("cond")` / `("uncond")` in denoise loop; `refresh_context` before each run when cache-dit is enabled. |
+| Timesteps cache | Key `(image_seq_len, num_inference_steps, device)`; reused when same resolution/steps. Disabled when custom `sigmas` passed. |
+| Image latent IDs cache | Key `(latent_h, latent_w, ...)` per image, device; reused when same resolution. |
+| Prompt cache | Same prompt + encoder args → reuse `prompt_embeds` and `text_ids`. |
+| Fast preprocess | Resize → numpy → tensor → normalize; `pin_memory` and `non_blocking` H2D in `prepare_image_latents`. |
+
+Caches and fast preprocess are on by default. Toggle via `pipe._cache_timesteps`, `pipe._cache_image_latent_ids`, `pipe._cache_prompt`, `pipe._use_fast_preprocess`, `pipe._preprocess_pin_memory`, `pipe._preprocess_non_blocking_h2d`. Clear caches: `pipe.clear_inference_caches()`.
 
 ## Optional (call after load)
 

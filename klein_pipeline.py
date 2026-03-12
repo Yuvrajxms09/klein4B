@@ -205,6 +205,20 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self.tokenizer_max_length = 512
         self.default_sample_size = 128
 
+        # Inference caches (timesteps, image latent IDs, prompt). Keyed by (image_seq_len, num_steps, device),
+        # (latent_h, latent_w, ...), and (prompt, num_images_per_prompt, max_seq_len, text_encoder_layers).
+        self._timesteps_cache: dict[tuple[int, int, str], tuple[torch.Tensor, int]] = {}
+        self._image_latent_ids_cache: dict[tuple[tuple[tuple[int, int], ...], str], torch.Tensor] = {}
+        self._prompt_cache: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor]] = {}
+
+        # Fast preprocess and H2D: default on for inference.
+        self._use_fast_preprocess: bool = True
+        self._preprocess_pin_memory: bool = True
+        self._preprocess_non_blocking_h2d: bool = True
+        self._cache_timesteps: bool = True
+        self._cache_image_latent_ids: bool = True
+        self._cache_prompt: bool = True
+
     @staticmethod
     def _get_qwen3_prompt_embeds(
         text_encoder: Qwen3ForCausalLM,
@@ -438,6 +452,18 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             prompt = ""
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
+        cache_key = (
+            tuple(prompt),
+            num_images_per_prompt,
+            max_sequence_length,
+            tuple(text_encoder_out_layers),
+        )
+
+        if prompt_embeds is None and self._cache_prompt and cache_key in self._prompt_cache:
+            cached_embeds, cached_ids = self._prompt_cache[cache_key]
+            dev_type = getattr(device, "type", str(device).split(":")[0] if isinstance(device, str) else "")
+            non_blocking = dev_type == "cuda"
+            return cached_embeds.to(device, non_blocking=non_blocking), cached_ids.to(device, non_blocking=non_blocking)
 
         if prompt_embeds is None:
             prompt_embeds = self._get_qwen3_prompt_embeds(
@@ -455,7 +481,40 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
         text_ids = self._prepare_text_ids(prompt_embeds)
         text_ids = text_ids.to(device)
+        if self._cache_prompt:
+            self._prompt_cache[cache_key] = (prompt_embeds, text_ids)
         return prompt_embeds, text_ids
+
+    def _get_timesteps_cached(
+        self,
+        image_seq_len: int,
+        num_inference_steps: int,
+        device: torch.device | str,
+        sigmas: np.ndarray | list[float] | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, int]:
+        """Return timesteps from scheduler; use cache when _cache_timesteps is True and sigmas is None."""
+        use_cache = self._cache_timesteps and sigmas is None
+        device_str = str(device)
+        key = (int(image_seq_len), int(num_inference_steps), device_str)
+        if use_cache and key in self._timesteps_cache:
+            return self._timesteps_cache[key]
+        if sigmas is None:
+            sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps)
+        if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
+            sigmas = None
+        mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
+        timesteps, steps = retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps,
+            device,
+            sigmas=sigmas,
+            mu=mu,
+            **kwargs,
+        )
+        if use_cache:
+            self._timesteps_cache[key] = (timesteps, steps)
+        return timesteps, steps
 
     # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._encode_vae_image
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
@@ -513,14 +572,26 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         generator: torch.Generator,
         device,
         dtype,
+        *,
+        non_blocking_h2d: bool = True,
     ):
         image_latents = []
         for image in images:
-            image = image.to(device=device, dtype=dtype)
-            imagge_latent = self._encode_vae_image(image=image, generator=generator)
-            image_latents.append(imagge_latent)  # (1, 128, 32, 32)
+            image = image.to(device=device, dtype=dtype, non_blocking=non_blocking_h2d)
+            image_latent = self._encode_vae_image(image=image, generator=generator)
+            image_latents.append(image_latent)  # (1, 128, 32, 32)
 
-        image_latent_ids = self._prepare_image_ids(image_latents)
+        latent_ids_key = tuple((latent.shape[2], latent.shape[3]) for latent in image_latents)
+        device_str = str(device)
+        cache_key = (latent_ids_key, device_str)
+        if self._cache_image_latent_ids and cache_key in self._image_latent_ids_cache:
+            image_latent_ids = self._image_latent_ids_cache[cache_key].repeat(batch_size, 1, 1)
+        else:
+            image_latent_ids = self._prepare_image_ids(image_latents)
+            image_latent_ids = image_latent_ids.to(device, non_blocking=non_blocking_h2d)
+            if self._cache_image_latent_ids:
+                self._image_latent_ids_cache[cache_key] = image_latent_ids
+            image_latent_ids = image_latent_ids.repeat(batch_size, 1, 1)
 
         # Pack each latent and concatenate
         packed_latents = []
@@ -535,10 +606,32 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         image_latents = image_latents.unsqueeze(0)  # (1, N*1024, 128)
 
         image_latents = image_latents.repeat(batch_size, 1, 1)
-        image_latent_ids = image_latent_ids.repeat(batch_size, 1, 1)
-        image_latent_ids = image_latent_ids.to(device)
 
         return image_latents, image_latent_ids
+
+    def _preprocess_image_fast(
+        self,
+        img: PIL.Image.Image,
+        height: int,
+        width: int,
+        resize_mode: str = "crop",
+    ) -> torch.Tensor:
+        """Convert PIL image to normalized tensor (1, 3, H, W). Optional pin_memory when CUDA."""
+        if img.size != (width, height):
+            resample = getattr(PIL.Image.Resampling, "BILINEAR", PIL.Image.BILINEAR)
+            img = img.resize((width, height), resample)
+        arr = np.array(img, dtype=np.uint8, copy=True)
+        out = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+        out = out.to(torch.float32).div_(127.5).sub_(1.0)
+        if self._preprocess_pin_memory and torch.cuda.is_available():
+            out = out.pin_memory()
+        return out
+
+    def clear_inference_caches(self) -> None:
+        """Clear timesteps, image latent IDs, and prompt caches."""
+        self._timesteps_cache.clear()
+        self._image_latent_ids_cache.clear()
+        self._prompt_cache.clear()
 
     def check_inputs(
         self,
@@ -771,8 +864,13 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 multiple_of = self.vae_scale_factor * 2
                 image_width = (image_width // multiple_of) * multiple_of
                 image_height = (image_height // multiple_of) * multiple_of
-                img = self.image_processor.preprocess(img, height=image_height, width=image_width, resize_mode="crop")
-                condition_images.append(img)
+                if self._use_fast_preprocess:
+                    condition_images.append(
+                        self._preprocess_image_fast(img, height=image_height, width=image_width, resize_mode="crop")
+                    )
+                else:
+                    img = self.image_processor.preprocess(img, height=image_height, width=image_width, resize_mode="crop")
+                    condition_images.append(img)
                 height = height or image_height
                 width = width or image_width
 
@@ -801,20 +899,14 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 generator=generator,
                 device=device,
                 dtype=self.vae.dtype,
+                non_blocking_h2d=self._preprocess_non_blocking_h2d,
             )
 
         # 6. Prepare timesteps
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-        if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
-            sigmas = None
         image_seq_len = latents.shape[1]
-        mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
-        timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
-            num_inference_steps,
-            device,
-            sigmas=sigmas,
-            mu=mu,
+        sigmas_arg = np.asarray(sigmas) if sigmas is not None else None
+        timesteps, num_inference_steps = self._get_timesteps_cached(
+            image_seq_len, num_inference_steps, device, sigmas=sigmas_arg
         )
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
