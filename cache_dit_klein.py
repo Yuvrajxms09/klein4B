@@ -57,7 +57,7 @@ def enable_cache_dit(
 ) -> None:
     """
     Enable cache-dit (DBCache) on the pipeline's transformer. Call once after
-    loading (e.g. after from_pretrained, optionally after replace_pipeline_vae_with_taef2).
+    loading (e.g. after from_pretrained).
 
     Defaults match flux-stream-editor (FastFlux2Config): cache_fn=1, cache_bn=0,
     residual_diff_threshold=0.8, single_block_rdt_scale=3.0, max_warmup_steps=0.
