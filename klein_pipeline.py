@@ -230,6 +230,48 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
         self._kv_attn_processors_set = False
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *, transformer=None, **kwargs):
+        """Load pipeline with transformer as Flux2Transformer2DModelKV so KV cache works.
+
+        If `transformer` is not passed, the transformer is loaded via
+        Flux2Transformer2DModelKV.from_pretrained(..., subfolder="transformer") so the
+        pipeline gets the KV-aware forward (kv_cache, kv_cache_mode, etc.). Pass
+        `transformer=` explicitly when using device_map or a custom load.
+        """
+        if transformer is None:
+            transformer_kwargs = {
+                k: kwargs[k]
+                for k in (
+                    "variant",
+                    "local_files_only",
+                    "token",
+                    "revision",
+                    "cache_dir",
+                    "force_download",
+                    "use_safetensors",
+                    "low_cpu_mem_usage",
+                )
+                if k in kwargs
+            }
+            if "torch_dtype" in kwargs:
+                td = kwargs["torch_dtype"]
+                transformer_kwargs["torch_dtype"] = (
+                    td.get("transformer", td.get("default")) if isinstance(td, dict) else td
+                )
+            transformer = Flux2Transformer2DModelKV.from_pretrained(
+                pretrained_model_name_or_path,
+                subfolder="transformer",
+                **transformer_kwargs,
+            )
+        if not isinstance(transformer, Flux2Transformer2DModelKV):
+            raise TypeError(
+                f"transformer must be Flux2Transformer2DModelKV for KV cache support, got {type(transformer).__name__}"
+            )
+        return super(DiffusionPipeline, cls).from_pretrained(
+            pretrained_model_name_or_path, transformer=transformer, **kwargs
+        )
+
     def _ensure_kv_attn_processors(self):
         if self._kv_attn_processors_set:
             return
