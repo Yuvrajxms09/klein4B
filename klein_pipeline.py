@@ -268,7 +268,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             raise TypeError(
                 f"transformer must be Flux2Transformer2DModelKV for KV cache support, got {type(transformer).__name__}"
             )
-        return super(DiffusionPipeline, cls).from_pretrained(
+        return super().from_pretrained(
             pretrained_model_name_or_path, transformer=transformer, **kwargs
         )
 
