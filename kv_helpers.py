@@ -18,7 +18,7 @@ from diffusers.models.transformers.transformer_flux2 import (
     dispatch_attention_fn,
     apply_rotary_emb,
 )
-from diffusers.models.transformers.transformer_flux2 import Transformer2DModelOutput
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.utils import apply_lora_scale
 
 
