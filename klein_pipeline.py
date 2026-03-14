@@ -22,13 +22,18 @@ import torch
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 
 from diffusers.loaders import Flux2LoraLoaderMixin
-from diffusers.models import AutoencoderKLFlux2, Flux2Transformer2DModel
+from diffusers.models import AutoencoderKLFlux2
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import is_torch_xla_available, logging, replace_example_docstring
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 from diffusers.pipelines.flux2.pipeline_output import Flux2PipelineOutput
+from klein4B.kv_helpers import (
+    Flux2KVCache,
+    Flux2Transformer2DModelKV,
+    set_kv_attn_processors,
+)
 
 
 if is_torch_xla_available():
@@ -161,8 +166,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
     [https://bfl.ai/blog/flux2-klein-towards-interactive-visual-intelligence](https://bfl.ai/blog/flux2-klein-towards-interactive-visual-intelligence)
 
     Args:
-        transformer ([`Flux2Transformer2DModel`]):
-            Conditional Transformer (MMDiT) architecture to denoise the encoded image latents.
+        transformer ([`Flux2Transformer2DModelKV`]):
+            KV-aware Flux2 transformer used to denoise the encoded image latents.
         scheduler ([`FlowMatchEulerDiscreteScheduler`]):
             A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
         vae ([`AutoencoderKLFlux2`]):
@@ -183,7 +188,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         vae: AutoencoderKLFlux2,
         text_encoder: Qwen3ForCausalLM,
         tokenizer: Qwen2TokenizerFast,
-        transformer: Flux2Transformer2DModel,
+        transformer: Flux2Transformer2DModelKV,
         is_distilled: bool = False,
     ):
         super().__init__()
@@ -222,6 +227,14 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         # Optional torch.compile wrappers (set by enable_compile())
         self._vae_encode_fn: Callable | None = None
         self._vae_decode_fn: Callable | None = None
+
+        self._kv_attn_processors_set = False
+
+    def _ensure_kv_attn_processors(self):
+        if self._kv_attn_processors_set:
+            return
+        set_kv_attn_processors(self.transformer)
+        self._kv_attn_processors_set = True
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -802,6 +815,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
         text_encoder_out_layers: tuple[int] = (9, 18, 27),
+        use_kv_cache: bool = False,
+        ref_fixed_timestep: float = 0.0,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -853,6 +868,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~pipelines.qwenimage.QwenImagePipelineOutput`] instead of a plain tuple.
+            use_kv_cache (`bool`, *optional*, defaults to `False`):
+                Enable KV caching for reference-image conditioned runs. Requires `image` to be provided.
+            ref_fixed_timestep (`float`, *optional*, defaults to `0.0`):
+                Fixed timestep used to modulate reference tokens during the extract step.
             attention_kwargs (`dict`, *optional*):
                 A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
                 `self.processor` in
@@ -983,6 +1002,12 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 non_blocking_h2d=self._preprocess_non_blocking_h2d,
             )
 
+        num_ref_tokens = image_latents.shape[1] if image_latents is not None else 0
+        kv_cache_enabled = use_kv_cache and image_latents is not None and num_ref_tokens > 0
+        kv_cache: Flux2KVCache | None = None
+        if kv_cache_enabled:
+            self._ensure_kv_attn_processors()
+
         # 6. Prepare timesteps
         image_seq_len = latents.shape[1]
         sigmas_arg = np.asarray(sigmas) if sigmas is not None else None
@@ -1024,8 +1049,12 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                     torch.compiler.cudagraph_mark_step_begin()
 
+                kv_mode = None
+                if kv_cache_enabled:
+                    kv_mode = "extract" if kv_cache is None else "cached"
+                kv_kwargs = self._build_kv_kwargs(kv_mode, kv_cache, num_ref_tokens, ref_fixed_timestep)
                 with self.transformer.cache_context("cond"):
-                    noise_pred = self.transformer(
+                    transformer_result = self.transformer(
                         hidden_states=latent_model_input,  # (B, image_seq_len, C)
                         timestep=timestep / 1000,
                         guidance=None,
@@ -1034,13 +1063,18 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                         img_ids=latent_image_ids,  # B, image_seq_len, 4
                         joint_attention_kwargs=self.attention_kwargs,
                         return_dict=False,
-                    )[0]
-
+                        **kv_kwargs,
+                    )
+                noise_pred, updated_cache = self._extract_transformer_output(transformer_result, kv_mode)
+                if updated_cache is not None:
+                    kv_cache = updated_cache
                 noise_pred = noise_pred[:, : latents.size(1) :]
 
                 if self.do_classifier_free_guidance:
+                    neg_kv_mode = "cached" if kv_cache_enabled and kv_cache is not None else None
+                    neg_kv_kwargs = self._build_kv_kwargs(neg_kv_mode, kv_cache, num_ref_tokens, ref_fixed_timestep)
                     with self.transformer.cache_context("uncond"):
-                        neg_noise_pred = self.transformer(
+                        neg_result = self.transformer(
                             hidden_states=latent_model_input,
                             timestep=timestep / 1000,
                             guidance=None,
@@ -1049,7 +1083,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                             img_ids=latent_image_ids,
                             joint_attention_kwargs=self._attention_kwargs,
                             return_dict=False,
-                        )[0]
+                            **neg_kv_kwargs,
+                        )
+                    neg_noise_pred = self._extract_transformer_output(neg_result, neg_kv_mode)[0]
                     neg_noise_pred = neg_noise_pred[:, : latents.size(1) :]
                     noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
 
@@ -1109,3 +1145,32 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             return (image,)
 
         return Flux2PipelineOutput(images=image)
+
+    def _build_kv_kwargs(
+        self,
+        kv_mode: str | None,
+        kv_cache: Flux2KVCache | None,
+        num_ref_tokens: int,
+        ref_fixed_timestep: float,
+    ) -> dict[str, Any]:
+        if kv_mode is None:
+            return {}
+        kwargs: dict[str, Any] = {
+            "kv_cache_mode": kv_mode,
+            "num_ref_tokens": num_ref_tokens,
+            "ref_fixed_timestep": ref_fixed_timestep,
+        }
+        if kv_mode == "cached" and kv_cache is not None:
+            kwargs["kv_cache"] = kv_cache
+        return kwargs
+
+    @staticmethod
+    def _extract_transformer_output(
+        transformer_output: tuple[torch.Tensor, ...] | tuple[tuple[torch.Tensor], Flux2KVCache],
+        kv_mode: str | None,
+    ) -> tuple[torch.Tensor, Flux2KVCache | None]:
+        if kv_mode == "extract":
+            (output,), kv_cache = transformer_output
+            return output, kv_cache
+        (output,) = transformer_output
+        return output, None
