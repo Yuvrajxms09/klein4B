@@ -27,9 +27,7 @@ ENV/
 
 # Cache / artifacts
 .cache/
-*.png
-*.jpg
-*.jpeg
+
 
 # IDE
 .idea/
