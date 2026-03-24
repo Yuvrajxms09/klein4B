@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -527,3 +527,227 @@ def _is_triton_available() -> bool:
         return True
     except Exception:
         return False
+
+
+def _resolve_state_dict_tensor(
+    state_dict: dict[str, Any],
+    module_name: str,
+    suffix: str,
+) -> Any | None:
+    candidates = (
+        f"{module_name}.{suffix}",
+        f"transformer.{module_name}.{suffix}",
+        f"model.{module_name}.{suffix}",
+    )
+    for key in candidates:
+        if key in state_dict:
+            return state_dict[key]
+    return None
+
+
+def _resolve_act_scale(act_scales: dict[str, Any], module_name: str) -> torch.Tensor | None:
+    candidates = (
+        module_name,
+        f"{module_name}.input_scale",
+        f"transformer.{module_name}",
+        f"transformer.{module_name}.input_scale",
+    )
+    for key in candidates:
+        if key in act_scales:
+            value = act_scales[key]
+            if isinstance(value, torch.Tensor):
+                return value.float().reshape(())
+            return torch.tensor(float(value), dtype=torch.float32)
+    return None
+
+
+def _extract_weight_scale_from_qtensor(qweight: Any) -> torch.Tensor | None:
+    # Best-effort extraction for common torchao tensor layouts.
+    for attr in ("scale", "scales", "_scale", "_scales"):
+        if hasattr(qweight, attr):
+            value = getattr(qweight, attr)
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:
+                    return value.float().reshape(())
+                return value.float().mean().reshape(())
+            try:
+                return torch.tensor(float(value), dtype=torch.float32)
+            except Exception:
+                pass
+    if hasattr(qweight, "tensor_impl"):
+        impl = getattr(qweight, "tensor_impl")
+        for attr in ("scale", "scales"):
+            if hasattr(impl, attr):
+                value = getattr(impl, attr)
+                if isinstance(value, torch.Tensor):
+                    if value.numel() == 1:
+                        return value.float().reshape(())
+                    return value.float().mean().reshape(())
+                try:
+                    return torch.tensor(float(value), dtype=torch.float32)
+                except Exception:
+                    pass
+    return None
+
+
+def _dequantize_to_fp8_tensor(qweight: Any, target_device: torch.device) -> torch.Tensor:
+    if isinstance(qweight, torch.Tensor):
+        return qweight.to(device=target_device, dtype=torch.float8_e4m3fn)
+    if hasattr(qweight, "dequantize"):
+        dense = qweight.dequantize()
+        if not isinstance(dense, torch.Tensor):
+            raise RuntimeError("quantized weight dequantize() did not return a torch.Tensor")
+        return dense.to(device=target_device, dtype=torch.float8_e4m3fn)
+    raise RuntimeError(f"unsupported quantized weight type: {type(qweight)}")
+
+
+def load_torchao_fp8_static_model(
+    *,
+    ckpt_path: str,
+    base_model_or_factory: Callable[[], nn.Module] | nn.Module,
+    device: str | torch.device = "cuda",
+    quantize_backend: str = "compile",
+    require_full_coverage: bool = True,
+    strict_checkpoint: bool = True,
+    verbose_print: bool = False,
+) -> tuple[nn.Module, dict[str, Any]]:
+    """
+    Load a torchao static-FP8 checkpoint (e.g. photoroom format) into a Flux2 transformer.
+
+    Expected checkpoint structure:
+    - state_dict: quantized weights
+    - act_scales: per-linear static activation scales
+    - fp8_dtype: optional string (e.g. "float8_e4m3fn")
+    """
+    logger.info("loading torchao fp8 static checkpoint: %s", ckpt_path)
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"torchao checkpoint must be a dict, got: {type(payload)}")
+    if "state_dict" not in payload or "act_scales" not in payload:
+        raise RuntimeError("torchao checkpoint must contain `state_dict` and `act_scales`")
+
+    q_state_dict = payload["state_dict"]
+    act_scales = payload["act_scales"]
+    fp8_dtype = payload.get("fp8_dtype", "unknown")
+    if not isinstance(q_state_dict, dict) or not isinstance(act_scales, dict):
+        raise RuntimeError("invalid torchao checkpoint: `state_dict`/`act_scales` must be dicts")
+
+    model = base_model_or_factory() if callable(base_model_or_factory) else base_model_or_factory
+    model = model.to(device)
+
+    linear_modules: list[tuple[str, nn.Linear]] = [(n, m) for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+    logger.info(
+        "torchao loader: fp8_dtype=%s linear_modules=%d q_state_tensors=%d act_scales=%d",
+        fp8_dtype,
+        len(linear_modules),
+        len(q_state_dict),
+        len(act_scales),
+    )
+    if verbose_print:
+        print(
+            "[torchao-loader] fp8_dtype=",
+            fp8_dtype,
+            " linear_modules=",
+            len(linear_modules),
+            " q_state_tensors=",
+            len(q_state_dict),
+            " act_scales=",
+            len(act_scales),
+        )
+
+    scales: dict[str, torch.Tensor] = {}
+    loaded_weights = 0
+    missing_weight_keys: list[str] = []
+    missing_act_scale: list[str] = []
+    weight_scale_fallback: list[str] = []
+    layer_debug_sample: list[dict[str, Any]] = []
+    sample_limit = 24
+
+    for module_name, linear in linear_modules:
+        qweight = _resolve_state_dict_tensor(q_state_dict, module_name, "weight")
+        if qweight is None:
+            missing_weight_keys.append(module_name)
+            logger.warning("torchao loader missing quantized weight for module=%s", module_name)
+            continue
+
+        try:
+            fp8_weight = _dequantize_to_fp8_tensor(qweight, target_device=linear.weight.device)
+            if fp8_weight.shape != linear.weight.shape:
+                raise RuntimeError(
+                    f"shape mismatch for {module_name}: ckpt={tuple(fp8_weight.shape)} model={tuple(linear.weight.shape)}"
+                )
+            with torch.no_grad():
+                linear.weight.copy_(fp8_weight)
+        except Exception as exc:
+            logger.exception("torchao weight load failure for module=%s", module_name)
+            raise RuntimeError(f"failed loading quantized weight for module `{module_name}`: {exc}") from exc
+
+        if linear.bias is not None:
+            qb = _resolve_state_dict_tensor(q_state_dict, module_name, "bias")
+            if qb is not None and isinstance(qb, torch.Tensor):
+                with torch.no_grad():
+                    linear.bias.copy_(qb.to(device=linear.bias.device, dtype=linear.bias.dtype))
+
+        in_scale = _resolve_act_scale(act_scales, module_name)
+        if in_scale is None:
+            missing_act_scale.append(module_name)
+            in_scale = torch.tensor(1.0, dtype=torch.float32)
+            logger.warning("torchao loader missing act scale for module=%s; fallback input_scale=1.0", module_name)
+        w_scale = _extract_weight_scale_from_qtensor(qweight)
+        if w_scale is None:
+            # Conservative fallback: if no explicit quant scale is discoverable, keep neutral multiplier.
+            w_scale = torch.tensor(1.0, dtype=torch.float32)
+            weight_scale_fallback.append(module_name)
+            logger.warning("no weight scale found for %s; fallback weight_scale=1.0", module_name)
+
+        scales[f"{module_name}.input_scale"] = in_scale
+        scales[f"{module_name}.weight_scale"] = w_scale
+        loaded_weights += 1
+
+        if len(layer_debug_sample) < sample_limit:
+            layer_debug_sample.append(
+                {
+                    "module": module_name,
+                    "qweight_type": type(qweight).__name__,
+                    "loaded_weight_shape": tuple(linear.weight.shape),
+                    "input_scale": float(in_scale.item()),
+                    "weight_scale": float(w_scale.item()),
+                }
+            )
+
+    if strict_checkpoint and missing_weight_keys:
+        raise RuntimeError(
+            f"torchao checkpoint missing {len(missing_weight_keys)} linear weights; sample={missing_weight_keys[:16]}"
+        )
+    if missing_act_scale:
+        logger.warning("torchao checkpoint missing act scales for %d linears; sample=%s", len(missing_act_scale), missing_act_scale[:16])
+
+    apply_result = apply_fp8_linears(
+        model,
+        scales=scales,
+        allow_cast_non_fp8_weights=False,
+        require_full_coverage=require_full_coverage,
+        quantize_backend=quantize_backend,
+    )
+    report = {
+        "fp8_dtype": fp8_dtype,
+        "linear_modules": len(linear_modules),
+        "loaded_weights": loaded_weights,
+        "missing_weight_keys": len(missing_weight_keys),
+        "missing_act_scale": len(missing_act_scale),
+        "weight_scale_fallback": len(weight_scale_fallback),
+        "missing_weight_keys_sample": missing_weight_keys[:16],
+        "missing_act_scale_sample": missing_act_scale[:16],
+        "weight_scale_fallback_sample": weight_scale_fallback[:16],
+        "layer_debug_sample": layer_debug_sample,
+        "apply_result": {
+            "total_linear": apply_result.total_linear,
+            "replaced": apply_result.replaced,
+            "skipped_no_scale": apply_result.skipped_no_scale,
+            "skipped_dtype": apply_result.skipped_dtype,
+        },
+    }
+    logger.info("torchao fp8 static load report: %s", report)
+    if verbose_print:
+        print("[torchao-loader] load_report:", report)
+    return model, report

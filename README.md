@@ -36,3 +36,30 @@ summary = pipe.enable_fp8_optimizations(
 )
 print(summary)
 ```
+
+### TorchAO static-FP8 checkpoint loader (Photoroom format)
+
+```python
+from diffusers import Flux2Transformer2DModel
+from huggingface_hub import hf_hub_download
+from fp8_optimizations import load_torchao_fp8_static_model
+
+ckpt_path = hf_hub_download(
+    "photoroom/FLUX.2-klein-4b-fp8-diffusers",
+    filename="transformer_fp8_static/model_fp8_static.pt",
+)
+
+transformer, load_report = load_torchao_fp8_static_model(
+    ckpt_path=ckpt_path,
+    base_model_or_factory=lambda: Flux2Transformer2DModel.from_pretrained(
+        "photoroom/FLUX.2-klein-4b-fp8-diffusers",
+        subfolder="transformer_bf16",
+        torch_dtype=torch.bfloat16,
+    ),
+    device="cuda",
+    quantize_backend="compile",
+    require_full_coverage=True,
+    verbose_print=True,  # print per-load diagnostics in notebook logs
+)
+print(load_report)
+```
