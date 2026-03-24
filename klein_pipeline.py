@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import inspect
+from collections.abc import Iterable
 from typing import Any, Callable
 
 import numpy as np
@@ -713,6 +714,97 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 logger.warning("vae decoder compile fallback to eager: %r", exc)
         else:
             self._vae_decode_fn = _decode_fn
+
+    def enable_fp8_optimizations(
+        self,
+        *,
+        scales: dict[str, torch.Tensor] | None = None,
+        scales_checkpoint_path: str | None = None,
+        hf_repo_id: str | None = None,
+        hf_revision: str | None = None,
+        default_input_scale: float | None = None,
+        default_weight_scale: float | None = None,
+        allow_cast_non_fp8_weights: bool = False,
+        include_modules: Iterable[str] | None = None,
+        require_full_coverage: bool = False,
+        quantize_backend: str = "compile",
+        validate_only: bool = False,
+        patch_rope: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Enable experimental FP8 linear path and optional Flux2 RoPE optimization.
+
+        This is opt-in on purpose: not all checkpoints expose calibrated scales.
+        """
+        from fp8_optimizations import (
+            apply_fp8_linears,
+            load_scales_from_checkpoint,
+            load_scales_from_hf_repo,
+            patch_flux2_rope_no_fp32_upcast,
+            validate_fp8_readiness,
+        )
+
+        logger.info(
+            "enable_fp8_optimizations called: "
+            "has_scales=%s scales_checkpoint_path=%s hf_repo_id=%s require_full_coverage=%s "
+            "quantize_backend=%s validate_only=%s patch_rope=%s",
+            scales is not None,
+            scales_checkpoint_path,
+            hf_repo_id,
+            require_full_coverage,
+            quantize_backend,
+            validate_only,
+            patch_rope,
+        )
+
+        if scales is None:
+            if scales_checkpoint_path is not None:
+                logger.info("loading fp8 scales from local checkpoint path: %s", scales_checkpoint_path)
+                scales = load_scales_from_checkpoint(scales_checkpoint_path, strict=True)
+            elif hf_repo_id is not None:
+                logger.info("loading fp8 scales from hf repo: repo=%s revision=%s", hf_repo_id, hf_revision)
+                scales = load_scales_from_hf_repo(hf_repo_id, revision=hf_revision, strict=True)
+            else:
+                logger.info("no explicit scale source provided; using provided defaults/scales only")
+
+        rope_patched = False
+        if patch_rope:
+            rope_patched = patch_flux2_rope_no_fp32_upcast()
+            logger.info("rope patch requested; applied=%s", rope_patched)
+
+        readiness = validate_fp8_readiness(self.transformer, scales or {})
+        if validate_only:
+            readiness["rope_patched"] = rope_patched
+            logger.info("fp8 readiness: %s", readiness)
+            return readiness
+
+        try:
+            result = apply_fp8_linears(
+                self.transformer,
+                scales=scales,
+                default_input_scale=default_input_scale,
+                default_weight_scale=default_weight_scale,
+                allow_cast_non_fp8_weights=allow_cast_non_fp8_weights,
+                include_modules=include_modules,
+                require_full_coverage=require_full_coverage,
+                quantize_backend=quantize_backend,
+            )
+        except Exception:
+            logger.exception("fp8 apply failed")
+            raise
+        summary = {
+            "total_linear": result.total_linear,
+            "replaced": result.replaced,
+            "skipped_no_scale": result.skipped_no_scale,
+            "skipped_dtype": result.skipped_dtype,
+            "missing_scale_modules": result.missing_scale_modules[:32],
+            "skipped_dtype_modules": result.skipped_dtype_modules[:32],
+            "rope_patched": rope_patched,
+            "quantize_backend": quantize_backend,
+            "readiness": readiness,
+        }
+        logger.info("fp8 optimization summary: %s", summary)
+        return summary
 
     def check_inputs(
         self,

@@ -7,6 +7,8 @@ Inference pipeline for `black-forest-labs/FLUX.2-klein-4B`: T2I and I2I via 4-st
 - **torch.compile** – Transformer and VAE encode/decode are compiled. `dynamic=True` so it doesn’t recompile across resolutions.
 - **Sage attention** – Default attention backend.
 - **cache-dit** – Faster transformer steps via DBCache.
+- **Optional FP8 experimental path** – `pipe.enable_fp8_optimizations(...)` can replace linear layers with an FP8 `torch._scaled_mm` path using calibrated scales auto-loaded from checkpoint/HF.
+- **Optional RoPE no-upcast patch** – enabled via `pipe.enable_fp8_optimizations(patch_rope=True)` to avoid per-call FP32 upcasting in Flux2 rotary embedding.
 
 We tried a lighter VAE (TAEF2) for faster encode/decode; it reduced output quality, so we keep the original VAE.
 
@@ -16,3 +18,21 @@ We tried a lighter VAE (TAEF2) for faster encode/decode; it reduced output quali
 - **`cache_dit_klein.py`** – `enable_cache_dit(pipe)` and `apply_attention_backend(pipe, "sage")` (or `"auto"` / `"native"`). Call after loading the pipeline.
 
 Enable compile after setup: `pipe.enable_compile(dynamic=True)`.
+
+## Experimental FP8 usage
+
+Use only when your checkpoint exposes calibrated scales.
+
+```python
+from klein_pipeline import Flux2KleinPipeline
+
+pipe = Flux2KleinPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16).to("cuda")
+summary = pipe.enable_fp8_optimizations(
+    scales_checkpoint_path="/path/to/model-or-transformer-dir",
+    # OR: hf_repo_id="black-forest-labs/FLUX.2-klein-base-9B",
+    quantize_backend="triton",   # "compile" or "triton"
+    require_full_coverage=True,  # fail fast if any linear is not FP8-mapped
+    patch_rope=True,
+)
+print(summary)
+```
