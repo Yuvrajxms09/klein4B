@@ -591,13 +591,16 @@ def _extract_weight_scale_from_qtensor(qweight: Any) -> torch.Tensor | None:
 
 
 def _dequantize_to_fp8_tensor(qweight: Any, target_device: torch.device) -> torch.Tensor:
-    if isinstance(qweight, torch.Tensor):
-        return qweight.to(device=target_device, dtype=torch.float8_e4m3fn)
+    # TorchAO quantized weights are tensor subclasses with custom dispatch.
+    # Calling copy_ directly on them can fail; always prefer explicit dequantize path.
     if hasattr(qweight, "dequantize"):
         dense = qweight.dequantize()
         if not isinstance(dense, torch.Tensor):
             raise RuntimeError("quantized weight dequantize() did not return a torch.Tensor")
-        return dense.to(device=target_device, dtype=torch.float8_e4m3fn)
+        return dense.detach().to(device=target_device, dtype=torch.float8_e4m3fn)
+    if isinstance(qweight, torch.Tensor):
+        # Plain tensor fallback.
+        return qweight.detach().to(device=target_device, dtype=torch.float8_e4m3fn)
     raise RuntimeError(f"unsupported quantized weight type: {type(qweight)}")
 
 
