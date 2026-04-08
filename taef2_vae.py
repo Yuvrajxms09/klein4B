@@ -2,8 +2,9 @@
 TAEF2 lightweight VAE support for Klein/FLUX.2 pipelines.
 
 Based on the wrapper pattern from https://huggingface.co/madebyollin/taef2 (Tiny
-AutoEncoder for FLUX.2). We add latent_dist.mode() for pipeline sample_mode="argmax"
-and copy the original VAE's BN running stats so normalize/denormalize stay correct.
+AutoEncoder for FLUX.2). We add latent_dist.mode() for pipeline sample_mode="argmax".
+BN buffers on the wrapper are left at defaults (same as flux-stream-editor
+_maybe_enable_taef2_vae: no copy from the original VAE).
 
 Use replace_pipeline_vae_with_taef2(pipe, ...) after loading the pipeline to swap
 the default VAE with a TAEF2 wrapper (same latent API, faster encode/decode).
@@ -167,8 +168,7 @@ def replace_pipeline_vae_with_taef2(
     Call this after loading the pipeline (e.g. Flux2KleinPipeline.from_pretrained(...)).
     Pipeline's vae_scale_factor is unchanged (set at init), so no pipeline code changes.
 
-    BN running stats are copied from the original VAE so latent normalize/denormalize
-    stays correct.
+    Does not copy BN running stats onto the wrapper (matches flux-stream-editor).
 
     Returns the same pipeline for chaining.
     """
@@ -199,11 +199,6 @@ def replace_pipeline_vae_with_taef2(
         bn_channels=bn_channels,
         batch_norm_eps=batch_norm_eps,
     )
-
-    if hasattr(pipe.vae.bn, "running_mean") and hasattr(pipe.vae.bn, "running_var"):
-        with torch.no_grad():
-            wrapper.bn.running_mean.copy_(pipe.vae.bn.running_mean)
-            wrapper.bn.running_var.copy_(pipe.vae.bn.running_var)
 
     pipe.vae = wrapper
     return pipe
