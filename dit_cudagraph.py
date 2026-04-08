@@ -61,7 +61,8 @@ class KleinDiTCudaGraphRunner:
 
     def __init__(self) -> None:
         self._key: DiTGraphKey | None = None
-        self._stream = torch.cuda.Stream()
+        # Created in try_capture on the same device as latents (not at pipeline __init__, which may be CPU).
+        self._stream: torch.cuda.Stream | None = None
         self._graph_cond: torch.cuda.CUDAGraph | None = None
         self._graph_uncond: torch.cuda.CUDAGraph | None = None
         self._static_hidden: torch.Tensor | None = None
@@ -89,6 +90,7 @@ class KleinDiTCudaGraphRunner:
         self._sample_cond = None
         self._sample_uncond = None
         self._latent_seq = 0
+        self._stream = None
 
     @property
     def is_ready(self) -> bool:
@@ -118,6 +120,7 @@ class KleinDiTCudaGraphRunner:
         self._key = key
 
         device = latents.device
+        self._stream = torch.cuda.Stream(device=device)
         dt = transformer.dtype
         B, P, C = key.batch, key.packed_seq, key.latent_channels
 
@@ -262,8 +265,11 @@ class KleinDiTCudaGraphRunner:
         self._static_timestep.copy_(ts / 1000)
 
     def _replay_stream_sync(self, device: torch.device) -> None:
+        s = self._stream
+        if s is None:
+            raise RuntimeError("DiT CUDA graph stream is not initialized")
         wf = torch.cuda.current_stream(device)
-        wf.wait_stream(self._stream)
+        wf.wait_stream(s)
 
     def replay_cond(
         self,
@@ -278,7 +284,10 @@ class KleinDiTCudaGraphRunner:
         compute_dtype: torch.dtype,
     ) -> torch.Tensor:
         dt = compute_dtype
-        with torch.cuda.stream(self._stream):
+        s = self._stream
+        if s is None:
+            raise RuntimeError("DiT CUDA graph replay before successful capture")
+        with torch.cuda.stream(s):
             self._pack_static_hidden(latents, image_latents, dt)
             self._copy_timestep(t_step, latents)
             self._static_encoder_cond.copy_(prompt_embeds)
@@ -301,7 +310,10 @@ class KleinDiTCudaGraphRunner:
         compute_dtype: torch.dtype,
     ) -> torch.Tensor:
         dt = compute_dtype
-        with torch.cuda.stream(self._stream):
+        s = self._stream
+        if s is None:
+            raise RuntimeError("DiT CUDA graph replay before successful capture")
+        with torch.cuda.stream(s):
             self._pack_static_hidden(latents, image_latents, dt)
             self._copy_timestep(t_step, latents)
             self._static_encoder_uncond.copy_(negative_prompt_embeds)
