@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import inspect
+import os
+import time
 from typing import Any, Callable
 
 import numpy as np
@@ -40,6 +42,27 @@ else:
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+# Enable with __call__(..., profile=True) or env FLUX2_KLEIN_PROFILE=1
+_FLUX2_KLEIN_PROFILE_ENV = "FLUX2_KLEIN_PROFILE"
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _resolve_inference_profile_flag(profile: bool | None) -> bool:
+    if profile is not None:
+        return profile
+    return _truthy_env(_FLUX2_KLEIN_PROFILE_ENV)
+
+
+def _sync_accelerator(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps" and torch.backends.mps.is_available():
+        torch.mps.synchronize()
+
 
 EXAMPLE_DOC_STRING = """
     Examples:
@@ -222,6 +245,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         # Optional torch.compile wrappers (set by enable_compile())
         self._vae_encode_fn: Callable | None = None
         self._vae_decode_fn: Callable | None = None
+
+        # Set by __call__ when profile=True or FLUX2_KLEIN_PROFILE is enabled (milliseconds).
+        self._last_inference_profile: dict[str, float] | None = None
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -802,6 +828,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
         text_encoder_out_layers: tuple[int] = (9, 18, 27),
+        profile: bool | None = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -869,6 +896,11 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             max_sequence_length (`int` defaults to 512): Maximum sequence length to use with the `prompt`.
             text_encoder_out_layers (`tuple[int]`):
                 Layer indices to use in the `text_encoder` to derive the final prompt embeddings.
+            profile (`bool`, *optional*):
+                When ``True``, records per-phase inference timings (ms) on ``self._last_inference_profile`` and logs a
+                summary. When ``None``, profiling is enabled if env ``FLUX2_KLEIN_PROFILE`` is truthy (``1``, ``true``,
+                ``yes``). Uses accelerator synchronization so GPU sections reflect device work; when disabled, overhead
+                is negligible.
 
         Examples:
 
@@ -893,6 +925,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._current_timestep = None
         self._interrupt = False
 
+        profile_inference = _resolve_inference_profile_flag(profile)
+        text_encoder_s = vae_encode_s = transformer_s = vae_decode_s = 0.0
+
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
@@ -903,7 +938,16 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
         device = self._execution_device
 
+        if profile_inference:
+            wall_t0 = time.perf_counter()
+        else:
+            self._last_inference_profile = None
+
         # 3. prepare text embeddings
+        if profile_inference:
+            _sync_accelerator(device)
+            _t0 = time.perf_counter()
+
         prompt_embeds, text_ids = self.encode_prompt(
             prompt=prompt,
             prompt_embeds=prompt_embeds,
@@ -925,6 +969,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 max_sequence_length=max_sequence_length,
                 text_encoder_out_layers=text_encoder_out_layers,
             )
+
+        if profile_inference:
+            _sync_accelerator(device)
+            text_encoder_s += time.perf_counter() - _t0
 
         # 4. process images
         if image is not None and not isinstance(image, list):
@@ -974,6 +1022,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         image_latents = None
         image_latent_ids = None
         if condition_images is not None:
+            if profile_inference:
+                _sync_accelerator(device)
+                _t0 = time.perf_counter()
+
             image_latents, image_latent_ids = self.prepare_image_latents(
                 images=condition_images,
                 batch_size=batch_size * num_images_per_prompt,
@@ -982,6 +1034,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 dtype=self.vae.dtype,
                 non_blocking_h2d=self._preprocess_non_blocking_h2d,
             )
+
+            if profile_inference:
+                _sync_accelerator(device)
+                vae_encode_s += time.perf_counter() - _t0
 
         # 6. Prepare timesteps
         image_seq_len = latents.shape[1]
@@ -1024,6 +1080,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                     torch.compiler.cudagraph_mark_step_begin()
 
+                if profile_inference:
+                    _sync_accelerator(device)
+                    _t0 = time.perf_counter()
+
                 with self.transformer.cache_context("cond"):
                     noise_pred = self.transformer(
                         hidden_states=latent_model_input,  # (B, image_seq_len, C)
@@ -1036,9 +1096,17 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                         return_dict=False,
                     )[0]
 
+                if profile_inference:
+                    _sync_accelerator(device)
+                    transformer_s += time.perf_counter() - _t0
+
                 noise_pred = noise_pred[:, : latents.size(1) :]
 
                 if self.do_classifier_free_guidance:
+                    if profile_inference:
+                        _sync_accelerator(device)
+                        _t0 = time.perf_counter()
+
                     with self.transformer.cache_context("uncond"):
                         neg_noise_pred = self.transformer(
                             hidden_states=latent_model_input,
@@ -1050,6 +1118,11 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                             joint_attention_kwargs=self._attention_kwargs,
                             return_dict=False,
                         )[0]
+
+                    if profile_inference:
+                        _sync_accelerator(device)
+                        transformer_s += time.perf_counter() - _t0
+
                     neg_noise_pred = neg_noise_pred[:, : latents.size(1) :]
                     noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
 
@@ -1080,6 +1153,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
         self._current_timestep = None
 
+        if profile_inference:
+            _sync_accelerator(device)
+            _t0 = time.perf_counter()
+
         latents = self._unpack_latents_with_ids(latents, latent_ids)
 
         latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
@@ -1101,6 +1178,36 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             else:
                 image = self.vae.decode(latents, return_dict=False)[0]
             image = self.image_processor.postprocess(image, output_type=output_type)
+
+        if profile_inference:
+            _sync_accelerator(device)
+            vae_decode_s += time.perf_counter() - _t0
+            _sync_accelerator(device)
+            total_ms = (time.perf_counter() - wall_t0) * 1000.0
+            te_ms = text_encoder_s * 1000.0
+            ve_ms = vae_encode_s * 1000.0
+            tr_ms = transformer_s * 1000.0
+            vd_ms = vae_decode_s * 1000.0
+            accounted = te_ms + ve_ms + tr_ms + vd_ms
+            stats: dict[str, float] = {
+                "text_encoder_ms": round(te_ms, 3),
+                "vae_encode_ms": round(ve_ms, 3),
+                "transformer_ms": round(tr_ms, 3),
+                "vae_decode_ms": round(vd_ms, 3),
+                "total_ms": round(total_ms, 3),
+                "other_ms": round(total_ms - accounted, 3),
+            }
+            self._last_inference_profile = stats
+            logger.info(
+                "[Flux2Klein] inference profile: text_encoder=%.3f ms, vae_encode=%.3f ms, transformer=%.3f ms, "
+                "vae_decode=%.3f ms, other=%.3f ms, total=%.3f ms",
+                stats["text_encoder_ms"],
+                stats["vae_encode_ms"],
+                stats["transformer_ms"],
+                stats["vae_decode_ms"],
+                stats["other_ms"],
+                stats["total_ms"],
+            )
 
         # Offload all models
         self.maybe_free_model_hooks()
