@@ -32,6 +32,11 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 from diffusers.pipelines.flux2.pipeline_output import Flux2PipelineOutput
 
+try:
+    from .dit_cudagraph import DiTGraphKey, KleinDiTCudaGraphRunner
+except ImportError:
+    from dit_cudagraph import DiTGraphKey, KleinDiTCudaGraphRunner
+
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -45,6 +50,8 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 # Enable with __call__(..., profile=True) or env FLUX2_KLEIN_PROFILE=1
 _FLUX2_KLEIN_PROFILE_ENV = "FLUX2_KLEIN_PROFILE"
+# Enable DiT manual CUDA graph: pipe.enable_dit_cudagraph() or FLUX2_KLEIN_DIT_CUDAGRAPH=1
+_FLUX2_KLEIN_DIT_CUDAGRAPH_ENV = "FLUX2_KLEIN_DIT_CUDAGRAPH"
 
 
 def _truthy_env(name: str) -> bool:
@@ -248,6 +255,40 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
         # Set by __call__ when profile=True or FLUX2_KLEIN_PROFILE is enabled (milliseconds).
         self._last_inference_profile: dict[str, float] | None = None
+
+        # Optional manual CUDA graph for transformer forwards (CUDA only; see enable_dit_cudagraph).
+        self._dit_cudagraph_enabled: bool = False
+        self._dit_cudagraph_runner = KleinDiTCudaGraphRunner()
+
+    def enable_dit_cudagraph(self, enabled: bool = True) -> None:
+        """Enable/disable manual CUDA graph capture for DiT forwards. Call after ``pipe.to('cuda')``.
+
+        Re-captures automatically when resolution, batch, img2img tokens, or text embedding shape changes.
+
+        Not used when ``attention_kwargs`` is set, cache-dit is active, ``callback_on_step_end`` is set,
+        or the execution device is not CUDA. May interact poorly with ``torch.compile`` on the transformer;
+        prefer DiT graphs on eager or quant-wrapped modules and validate outputs.
+        """
+        self._dit_cudagraph_enabled = bool(enabled)
+        if not self._dit_cudagraph_enabled:
+            self._dit_cudagraph_runner.reset()
+
+    def invalidate_dit_cudagraph(self) -> None:
+        """Drop captured DiT CUDA graphs (e.g. after custom transformer surgery)."""
+        self._dit_cudagraph_runner.reset()
+
+    def _resolve_dit_cudagraph_flag(self, dit_cudagraph: bool | None, device: torch.device) -> bool:
+        if dit_cudagraph is not None:
+            want = dit_cudagraph
+        else:
+            want = self._dit_cudagraph_enabled or _truthy_env(_FLUX2_KLEIN_DIT_CUDAGRAPH_ENV)
+        if not want:
+            return False
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return False
+        if XLA_AVAILABLE:
+            return False
+        return True
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -829,6 +870,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         max_sequence_length: int = 512,
         text_encoder_out_layers: tuple[int] = (9, 18, 27),
         profile: bool | None = None,
+        dit_cudagraph: bool | None = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -901,6 +943,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 summary. When ``None``, profiling is enabled if env ``FLUX2_KLEIN_PROFILE`` is truthy (``1``, ``true``,
                 ``yes``). Uses accelerator synchronization so GPU sections reflect device work; when disabled, overhead
                 is negligible.
+            dit_cudagraph (`bool`, *optional*):
+                When ``True``, use a captured CUDA graph for DiT forwards when supported. When ``False``, never use it.
+                When ``None``, use :meth:`enable_dit_cudagraph` and env ``FLUX2_KLEIN_DIT_CUDAGRAPH``.
 
         Examples:
 
@@ -1056,6 +1101,61 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 verbose=False,
             )
 
+        use_dit_cudagraph = self._resolve_dit_cudagraph_flag(dit_cudagraph, device)
+        if use_dit_cudagraph and cache_dit_mod is not None:
+            logger.warning("DiT CUDA graph disabled: cache-dit is active.")
+            use_dit_cudagraph = False
+        if use_dit_cudagraph and self.attention_kwargs is not None:
+            logger.warning("DiT CUDA graph disabled: attention_kwargs is set.")
+            use_dit_cudagraph = False
+        if use_dit_cudagraph and callback_on_step_end is not None:
+            logger.warning("DiT CUDA graph disabled: callback_on_step_end is set.")
+            use_dit_cudagraph = False
+
+        dit_runner = self._dit_cudagraph_runner
+        dit_graph_ok = False
+        if use_dit_cudagraph:
+            packed_seq = latents.size(1) + (
+                image_latents.size(1) if image_latents is not None else 0
+            )
+            dev_idx = device.index if device.index is not None else 0
+            gkey = DiTGraphKey(
+                device_index=dev_idx,
+                batch=latents.shape[0],
+                latent_seq=latents.size(1),
+                packed_seq=packed_seq,
+                latent_channels=latents.size(2),
+                text_seq=prompt_embeds.size(1),
+                text_width=prompt_embeds.size(2),
+                latent_dtype=latents.dtype,
+                compute_dtype=self.transformer.dtype,
+                needs_uncond_graph=self.do_classifier_free_guidance,
+            )
+            latent_image_ids_for_graph = (
+                torch.cat([latent_ids, image_latent_ids], dim=1)
+                if image_latents is not None
+                else latent_ids
+            )
+            if dit_runner.key_matches(gkey):
+                dit_graph_ok = True
+            else:
+                dit_graph_ok = dit_runner.try_capture(
+                    key=gkey,
+                    transformer=self.transformer,
+                    latent_seq=latents.size(1),
+                    joint_attention_kwargs=self.attention_kwargs,
+                    timesteps_0=timesteps[0],
+                    latents=latents,
+                    image_latents=image_latents,
+                    prompt_embeds=prompt_embeds,
+                    text_ids=text_ids,
+                    negative_prompt_embeds=negative_prompt_embeds
+                    if self.do_classifier_free_guidance
+                    else None,
+                    negative_text_ids=negative_text_ids if self.do_classifier_free_guidance else None,
+                    latent_image_ids=latent_image_ids_for_graph,
+                )
+
         # 7. Denoising loop
         # We set the index here to remove DtoH sync, helpful especially during compilation.
         # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
@@ -1070,60 +1170,82 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-                latent_model_input = latents.to(self.transformer.dtype)
-                latent_image_ids = latent_ids
-
-                if image_latents is not None:
-                    latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
-                    latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
-
-                if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                if not dit_graph_ok and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                     torch.compiler.cudagraph_mark_step_begin()
 
                 if profile_inference:
                     _sync_accelerator(device)
                     _t0 = time.perf_counter()
 
-                with self.transformer.cache_context("cond"):
-                    noise_pred = self.transformer(
-                        hidden_states=latent_model_input,  # (B, image_seq_len, C)
-                        timestep=timestep / 1000,
-                        guidance=None,
-                        encoder_hidden_states=prompt_embeds,
-                        txt_ids=text_ids,  # B, text_seq_len, 4
-                        img_ids=latent_image_ids,  # B, image_seq_len, 4
-                        joint_attention_kwargs=self.attention_kwargs,
-                        return_dict=False,
-                    )[0]
+                if dit_graph_ok:
+                    noise_pred = dit_runner.replay_cond(
+                        device=device,
+                        latents=latents,
+                        image_latents=image_latents,
+                        t_step=t,
+                        prompt_embeds=prompt_embeds,
+                        text_ids=text_ids,
+                        latent_image_ids=latent_image_ids_for_graph,
+                        compute_dtype=self.transformer.dtype,
+                    )
+                else:
+                    latent_model_input = latents.to(self.transformer.dtype)
+                    latent_image_ids = latent_ids
+                    if image_latents is not None:
+                        latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
+                        latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
+
+                    with self.transformer.cache_context("cond"):
+                        noise_pred = self.transformer(
+                            hidden_states=latent_model_input,  # (B, image_seq_len, C)
+                            timestep=timestep / 1000,
+                            guidance=None,
+                            encoder_hidden_states=prompt_embeds,
+                            txt_ids=text_ids,  # B, text_seq_len, 4
+                            img_ids=latent_image_ids,  # B, image_seq_len, 4
+                            joint_attention_kwargs=self.attention_kwargs,
+                            return_dict=False,
+                        )[0]
+                    noise_pred = noise_pred[:, : latents.size(1) :]
 
                 if profile_inference:
                     _sync_accelerator(device)
                     transformer_s += time.perf_counter() - _t0
-
-                noise_pred = noise_pred[:, : latents.size(1) :]
 
                 if self.do_classifier_free_guidance:
                     if profile_inference:
                         _sync_accelerator(device)
                         _t0 = time.perf_counter()
 
-                    with self.transformer.cache_context("uncond"):
-                        neg_noise_pred = self.transformer(
-                            hidden_states=latent_model_input,
-                            timestep=timestep / 1000,
-                            guidance=None,
-                            encoder_hidden_states=negative_prompt_embeds,
-                            txt_ids=negative_text_ids,
-                            img_ids=latent_image_ids,
-                            joint_attention_kwargs=self._attention_kwargs,
-                            return_dict=False,
-                        )[0]
+                    if dit_graph_ok:
+                        neg_noise_pred = dit_runner.replay_uncond(
+                            device=device,
+                            latents=latents,
+                            image_latents=image_latents,
+                            t_step=t,
+                            negative_prompt_embeds=negative_prompt_embeds,
+                            negative_text_ids=negative_text_ids,
+                            latent_image_ids=latent_image_ids_for_graph,
+                            compute_dtype=self.transformer.dtype,
+                        )
+                    else:
+                        with self.transformer.cache_context("uncond"):
+                            neg_noise_pred = self.transformer(
+                                hidden_states=latent_model_input,
+                                timestep=timestep / 1000,
+                                guidance=None,
+                                encoder_hidden_states=negative_prompt_embeds,
+                                txt_ids=negative_text_ids,
+                                img_ids=latent_image_ids,
+                                joint_attention_kwargs=self._attention_kwargs,
+                                return_dict=False,
+                            )[0]
+                        neg_noise_pred = neg_noise_pred[:, : latents.size(1) :]
 
                     if profile_inference:
                         _sync_accelerator(device)
                         transformer_s += time.perf_counter() - _t0
 
-                    neg_noise_pred = neg_noise_pred[:, : latents.size(1) :]
                     noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
 
                 # compute the previous noisy sample x_t -> x_t-1
