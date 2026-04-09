@@ -16,6 +16,67 @@ import torch
 from typing import Any
 
 
+def latent_token_count_for_resolution(pipe: Any, height: int, width: int) -> int:
+    """
+    Compute packed latent token length (H*W in packed latent space) used by the denoiser.
+    """
+    multiple_of = int(pipe.vae_scale_factor) * 2
+    h = 2 * (int(height) // multiple_of)
+    w = 2 * (int(width) // multiple_of)
+    return (h // 2) * (w // 2)
+
+
+def load_ported_cuda_kernels(module_name: str = "klein_cuda_ext") -> Any:
+    """
+    Load compiled CUDA kernel extension module and return torch.ops namespace.
+    """
+    __import__(module_name)
+    ns = getattr(torch.ops, "klein_cuda", None)
+    if ns is None:
+        raise RuntimeError(f"Loaded {module_name} but torch.ops.klein_cuda is unavailable")
+    return ns
+
+
+def enable_klein_c_cuda_backend(
+    pipe: Any,
+    *,
+    model_dir: str,
+    bridge_lib_path: str | None = None,
+    enforce_single_ref: bool = False,
+) -> None:
+    """
+    Use klein-cuda-c backend (Option A) for transformer denoising via ctypes bridge.
+
+    This delegates denoising to klein-cuda-c runtime and keeps scheduler/VAE/text flow in Python.
+    """
+    if not hasattr(pipe, "set_cuda_denoiser"):
+        raise AttributeError("Pipeline does not support custom CUDA denoiser registration")
+
+    from klein_c_bridge import make_klein_c_denoiser
+
+    denoiser = make_klein_c_denoiser(
+        pipe,
+        model_dir=model_dir,
+        bridge_lib_path=bridge_lib_path,
+        enforce_single_ref=enforce_single_ref,
+    )
+    pipe.set_cuda_denoiser(denoiser, name="klein-cuda-c-bridge")
+
+
+def build_klein_c_full_backend(
+    *,
+    model_dir: str,
+    lib_path: str | None = None,
+    use_mmap: bool = True,
+) -> Any:
+    """
+    Build full native klein-cuda-c backend for end-to-end C/CUDA img2img and multiref.
+    """
+    from klein_c_full_backend import KleinCFullBackend
+
+    return KleinCFullBackend(model_dir=model_dir, lib_path=lib_path, use_mmap=use_mmap)
+
+
 def _parse_steps_mask(mask_text: str, expected_steps: int) -> list[int]:
     cleaned = mask_text.replace(",", "").replace(" ", "")
     if not cleaned:
@@ -208,3 +269,58 @@ def apply_transformer_compile(
     else:
         kwargs["mode"] = mode
     pipe.transformer = torch.compile(pipe.transformer, **kwargs)
+
+
+def enable_cuda_denoiser_op(
+    pipe: Any,
+    op_path: str = "klein_cuda.denoise_step",
+    *,
+    expected_hidden_tokens: int | None = None,
+    enforce_cfg1: bool = False,
+) -> None:
+    """
+    Register a torch.ops-backed CUDA denoiser callback for pipeline denoising.
+
+    Expected op signature:
+      denoise_step(hidden_states, timestep, encoder_hidden_states, txt_ids, img_ids) -> noise_pred
+
+    Args:
+      expected_hidden_tokens: Optional sequence-length guard for fixed-shape inference.
+      enforce_cfg1: If True, reject the "uncond" path (requires guidance_scale == 1.0).
+    """
+    if not hasattr(pipe, "set_cuda_denoiser"):
+        raise AttributeError("Pipeline does not support custom CUDA denoiser registration")
+    namespace, op_name = op_path.rsplit(".", 1)
+    op_ns = getattr(torch.ops, namespace, None)
+    if op_ns is None:
+        raise RuntimeError(f"torch.ops namespace not found: {namespace}")
+    op = getattr(op_ns, op_name, None)
+    if op is None:
+        raise RuntimeError(f"torch.ops op not found: {op_path}")
+
+    def _denoiser(
+        *,
+        transformer: Any,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        txt_ids: torch.Tensor,
+        img_ids: torch.Tensor,
+        joint_attention_kwargs: dict[str, Any] | None,
+        context: str,
+    ) -> torch.Tensor:
+        del transformer, joint_attention_kwargs
+        if enforce_cfg1 and context == "uncond":
+            raise RuntimeError("CUDA denoiser configured with enforce_cfg1=True but uncond path was requested")
+        if expected_hidden_tokens is not None and hidden_states.shape[1] != expected_hidden_tokens:
+            raise RuntimeError(
+                f"CUDA denoiser expected hidden token length {expected_hidden_tokens}, got {hidden_states.shape[1]}",
+            )
+        out = op(hidden_states, timestep / 1000, encoder_hidden_states, txt_ids, img_ids)
+        if out.shape != hidden_states.shape:
+            raise RuntimeError(
+                f"CUDA denoiser output shape mismatch: expected {tuple(hidden_states.shape)}, got {tuple(out.shape)}",
+            )
+        return out
+
+    pipe.set_cuda_denoiser(_denoiser, name=op_path)

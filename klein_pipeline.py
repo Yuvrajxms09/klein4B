@@ -248,6 +248,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
         # Set by __call__ when profile=True or FLUX2_KLEIN_PROFILE is enabled (milliseconds).
         self._last_inference_profile: dict[str, float] | None = None
+        self._cuda_denoiser: Callable[..., torch.Tensor] | None = None
+        self._cuda_denoiser_name: str | None = None
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -740,6 +742,67 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         else:
             self._vae_decode_fn = _decode_fn
 
+    def set_cuda_denoiser(
+        self,
+        denoiser: Callable[..., torch.Tensor] | None,
+        *,
+        name: str = "custom",
+    ) -> None:
+        """
+        Register a CUDA denoiser callback to replace transformer forward in denoising.
+
+        The callback must accept keyword arguments:
+          transformer, hidden_states, timestep, encoder_hidden_states, txt_ids, img_ids,
+          joint_attention_kwargs, context
+        and return a tensor shaped like transformer output [B, seq, C].
+        """
+        self._cuda_denoiser = denoiser
+        self._cuda_denoiser_name = name if denoiser is not None else None
+
+    def _run_denoiser(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        txt_ids: torch.Tensor,
+        img_ids: torch.Tensor,
+        joint_attention_kwargs: dict[str, Any] | None,
+        context: str,
+    ) -> torch.Tensor:
+        use_cuda_denoiser = (
+            self._cuda_denoiser is not None
+            and hidden_states.device.type == "cuda"
+        )
+        if use_cuda_denoiser:
+            noise_pred = self._cuda_denoiser(
+                transformer=self.transformer,
+                hidden_states=hidden_states,
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                txt_ids=txt_ids,
+                img_ids=img_ids,
+                joint_attention_kwargs=joint_attention_kwargs,
+                context=context,
+            )
+            if not isinstance(noise_pred, torch.Tensor):
+                raise TypeError(
+                    f"CUDA denoiser '{self._cuda_denoiser_name}' must return torch.Tensor, got {type(noise_pred)}",
+                )
+            return noise_pred
+
+        with self.transformer.cache_context(context):
+            return self.transformer(
+                hidden_states=hidden_states,  # (B, image_seq_len, C)
+                timestep=timestep / 1000,
+                guidance=None,
+                encoder_hidden_states=encoder_hidden_states,
+                txt_ids=txt_ids,
+                img_ids=img_ids,
+                joint_attention_kwargs=joint_attention_kwargs,
+                return_dict=False,
+            )[0]
+
     def check_inputs(
         self,
         prompt,
@@ -1084,17 +1147,15 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                     _sync_accelerator(device)
                     _t0 = time.perf_counter()
 
-                with self.transformer.cache_context("cond"):
-                    noise_pred = self.transformer(
-                        hidden_states=latent_model_input,  # (B, image_seq_len, C)
-                        timestep=timestep / 1000,
-                        guidance=None,
-                        encoder_hidden_states=prompt_embeds,
-                        txt_ids=text_ids,  # B, text_seq_len, 4
-                        img_ids=latent_image_ids,  # B, image_seq_len, 4
-                        joint_attention_kwargs=self.attention_kwargs,
-                        return_dict=False,
-                    )[0]
+                noise_pred = self._run_denoiser(
+                    hidden_states=latent_model_input,
+                    timestep=timestep,
+                    encoder_hidden_states=prompt_embeds,
+                    txt_ids=text_ids,  # B, text_seq_len, 4
+                    img_ids=latent_image_ids,  # B, image_seq_len, 4
+                    joint_attention_kwargs=self.attention_kwargs,
+                    context="cond",
+                )
 
                 if profile_inference:
                     _sync_accelerator(device)
@@ -1107,17 +1168,15 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                         _sync_accelerator(device)
                         _t0 = time.perf_counter()
 
-                    with self.transformer.cache_context("uncond"):
-                        neg_noise_pred = self.transformer(
-                            hidden_states=latent_model_input,
-                            timestep=timestep / 1000,
-                            guidance=None,
-                            encoder_hidden_states=negative_prompt_embeds,
-                            txt_ids=negative_text_ids,
-                            img_ids=latent_image_ids,
-                            joint_attention_kwargs=self._attention_kwargs,
-                            return_dict=False,
-                        )[0]
+                    neg_noise_pred = self._run_denoiser(
+                        hidden_states=latent_model_input,
+                        timestep=timestep,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        txt_ids=negative_text_ids,
+                        img_ids=latent_image_ids,
+                        joint_attention_kwargs=self._attention_kwargs,
+                        context="uncond",
+                    )
 
                     if profile_inference:
                         _sync_accelerator(device)
