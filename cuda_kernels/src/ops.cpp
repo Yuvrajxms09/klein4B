@@ -28,7 +28,7 @@ torch::Tensor adaln_norm(torch::Tensor x, torch::Tensor shift, torch::Tensor sca
     return adaln_norm_cuda(x, shift, scale, eps);
 }
 
-std::vector<torch::Tensor> qk_rms_norm_(torch::Tensor q, torch::Tensor k, torch::Tensor qw, torch::Tensor kw, double eps) {
+torch::Tensor qk_rms_norm_(torch::Tensor q, torch::Tensor k, torch::Tensor qw, torch::Tensor kw, double eps) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && qw.is_cuda() && kw.is_cuda(), "all tensors must be CUDA");
     TORCH_CHECK(q.scalar_type() == torch::kFloat32, "q must be float32");
     TORCH_CHECK(k.scalar_type() == torch::kFloat32, "k must be float32");
@@ -38,7 +38,8 @@ std::vector<torch::Tensor> qk_rms_norm_(torch::Tensor q, torch::Tensor k, torch:
     TORCH_CHECK(q.sizes() == k.sizes(), "q and k shapes must match");
     TORCH_CHECK(qw.dim() == 1 && kw.dim() == 1, "qw and kw must be [head_dim]");
     TORCH_CHECK(qw.size(0) == q.size(2) && kw.size(0) == q.size(2), "qw/kw size mismatch");
-    return qk_rms_norm_cuda_(q, k, qw, kw, eps);
+    qk_rms_norm_cuda_(q, k, qw, kw, eps);
+    return q;
 }
 
 torch::Tensor rope_2d_offset_(torch::Tensor x, torch::Tensor cos, torch::Tensor sin, int64_t seq_offset, int64_t seq_len) {
@@ -60,7 +61,7 @@ torch::Tensor rope_2d_offset_(torch::Tensor x, torch::Tensor cos, torch::Tensor 
 TORCH_LIBRARY(klein_cuda, m) {
     m.def("silu_mul_(Tensor(a!) gate, Tensor up) -> Tensor(a!)");
     m.def("adaln_norm(Tensor x, Tensor shift, Tensor scale, float eps=1e-6) -> Tensor");
-    m.def("qk_rms_norm_(Tensor(a!) q, Tensor(b!) k, Tensor qw, Tensor kw, float eps=1e-6) -> (Tensor(a!), Tensor(b!))");
+    m.def("qk_rms_norm_(Tensor(a!) q, Tensor(b!) k, Tensor qw, Tensor kw, float eps=1e-6) -> Tensor(a!)");
     m.def("rope_2d_offset_(Tensor(a!) x, Tensor cos, Tensor sin, int seq_offset, int seq_len) -> Tensor(a!)");
 }
 

@@ -10,7 +10,10 @@ if [[ ! -d "$KLEIN_C_DIR" ]]; then
   exit 1
 fi
 
-make -C "$KLEIN_C_DIR" cuda
+# Build CUDA objects with PIC so they can be linked into a shared library.
+PIC_CFLAGS="-Wall -Wextra -O3 -march=native -ffast-math -fPIC"
+make -C "$KLEIN_C_DIR" clean
+make -C "$KLEIN_C_DIR" cuda CFLAGS_BASE="$PIC_CFLAGS"
 
 cc -shared -fPIC -O3 -DUSE_CUDA \
   -I"$KLEIN_C_DIR" \

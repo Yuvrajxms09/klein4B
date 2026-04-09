@@ -250,6 +250,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._last_inference_profile: dict[str, float] | None = None
         self._cuda_denoiser: Callable[..., torch.Tensor] | None = None
         self._cuda_denoiser_name: str | None = None
+        self._klein_c_full_backend: Any | None = None
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -803,6 +804,41 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 return_dict=False,
             )[0]
 
+    def _run_full_backend_img2img(
+        self,
+        *,
+        image: PIL.Image.Image,
+        prompt: str,
+        height: int,
+        width: int,
+        num_inference_steps: int,
+        guidance_scale: float,
+        generator: torch.Generator | None,
+        output_type: str,
+    ) -> PIL.Image.Image:
+        backend = getattr(self, "_klein_c_full_backend", None)
+        if backend is None:
+            raise RuntimeError("Full backend is not enabled")
+        if output_type != "pil":
+            raise ValueError("Full backend path currently supports output_type='pil' only")
+        if generator is not None and not isinstance(generator, torch.Generator):
+            raise ValueError("Full backend path expects a single torch.Generator or None")
+
+        from cache_dit_klein import KleinGenerateConfig
+
+        seed = -1
+        if generator is not None:
+            seed = int(generator.initial_seed())
+
+        config = KleinGenerateConfig(
+            width=int(width),
+            height=int(height),
+            num_steps=int(num_inference_steps),
+            seed=seed,
+            guidance=float(guidance_scale),
+        )
+        return backend.img2img(prompt, image, config)
+
     def check_inputs(
         self,
         prompt,
@@ -1000,6 +1036,42 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             batch_size = prompt_embeds.shape[0]
 
         device = self._execution_device
+
+        full_backend = getattr(self, "_klein_c_full_backend", None)
+        if (
+            full_backend is not None
+            and image is not None
+            and prompt is not None
+            and prompt_embeds is None
+            and negative_prompt_embeds is None
+            and callback_on_step_end is None
+            and callback_on_step_end_tensor_inputs == ["latents"]
+        ):
+            if isinstance(image, list):
+                if len(image) != 1:
+                    raise ValueError("Full backend path currently supports a single input image")
+                image_in = image[0]
+            else:
+                image_in = image
+            if not isinstance(image_in, PIL.Image.Image):
+                raise TypeError("Full backend path expects a PIL input image")
+            if image_in.mode != "RGB":
+                image_in = image_in.convert("RGB")
+            height = height or image_in.height
+            width = width or image_in.width
+            out_img = self._run_full_backend_img2img(
+                image=image_in,
+                prompt=prompt,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator if isinstance(generator, torch.Generator) or generator is None else None,
+                output_type=output_type,
+            )
+            if return_dict:
+                return Flux2PipelineOutput(images=[out_img])
+            return ([out_img],)
 
         if profile_inference:
             wall_t0 = time.perf_counter()

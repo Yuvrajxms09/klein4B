@@ -7,6 +7,7 @@ Inference pipeline for `black-forest-labs/FLUX.2-klein-4B`: T2I and I2I via 4-st
 - **torch.compile** – Transformer and VAE encode/decode are compiled. `dynamic=True` so it doesn’t recompile across resolutions.
 - **Sage attention** – Default attention backend.
 - **cache-dit** – Faster transformer steps via DBCache.
+- **In-place Flux2 transformer patching** – `apply_flux2_transformer_klein_ops(transformer)` patches a loaded Diffusers Flux2 transformer instance to use the local CUDA-backed block helpers where the structure matches.
 
 We tried a lighter VAE (TAEF2) for faster encode/decode; it reduced output quality, so we keep the original VAE.
 
@@ -14,6 +15,7 @@ We tried a lighter VAE (TAEF2) for faster encode/decode; it reduced output quali
 
 - **`klein_pipeline.py`** – Loads and run T2I/I2I.
 - **`cache_dit_klein.py`** – `enable_cache_dit(pipe)` and `apply_attention_backend(pipe, "sage")` (or `"auto"` / `"native"`). Call after loading the pipeline.
+- **Flux2 transformer patching** – if your notebook loads `Flux2Transformer2DModel` from Diffusers, call `apply_flux2_transformer_klein_ops(pipe.transformer)` before `pipe.enable_compile(...)`.
 - **Custom CUDA denoiser hook** – Register a compiled `torch.ops` backend to replace transformer forward only:
   - `enable_cuda_denoiser_op(pipe, "klein_cuda.denoise_step", expected_hidden_tokens=..., enforce_cfg1=True)`
   - `latent_token_count_for_resolution(pipe, height=384, width=576)` helps compute expected tokens for fixed-shape runs.
@@ -37,3 +39,11 @@ We tried a lighter VAE (TAEF2) for faster encode/decode; it reduced output quali
   This runs img2img/multiref through `flux_img2img` / `flux_multiref` in the C/CUDA runtime.
 
 Enable compile after setup: `pipe.enable_compile(dynamic=True)`.
+
+For the Colab notebook stack you shared, the intended order is:
+
+1. Load the FP8 `Flux2Transformer2DModel`
+2. Call `apply_flux2_transformer_klein_ops(transformer)`
+3. Build the pipeline
+4. Apply `enable_cache_dit(pipe)` and `apply_attention_backend(pipe, "auto")`
+5. Call `pipe.enable_compile(...)`

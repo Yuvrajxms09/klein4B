@@ -14,6 +14,12 @@ from __future__ import annotations
 
 import torch
 from typing import Any
+from types import MethodType
+
+try:
+    from einops import rearrange
+except Exception:  # pragma: no cover - optional dependency in some envs
+    rearrange = None
 
 
 def latent_token_count_for_resolution(pipe: Any, height: int, width: int) -> int:
@@ -35,6 +41,152 @@ def load_ported_cuda_kernels(module_name: str = "klein_cuda_ext") -> Any:
     if ns is None:
         raise RuntimeError(f"Loaded {module_name} but torch.ops.klein_cuda is unavailable")
     return ns
+
+
+def apply_flux2_transformer_klein_ops(transformer: Any) -> Any:
+    """
+    Patch an in-memory Flux2 transformer instance to use the local CUDA-backed
+    optimization helpers where possible.
+
+    This is intentionally conservative: it only patches block methods when the
+    expected Flux2 block attributes exist. It can be called immediately after
+    loading the transformer and before torch.compile().
+    """
+    if rearrange is None:
+        raise RuntimeError("einops is required for Flux2 transformer patching")
+
+    ns = getattr(torch.ops, "klein_cuda", None)
+    if ns is None:
+        raise RuntimeError("torch.ops.klein_cuda is unavailable; load the extension first")
+
+    def _split_qkv_heads(qkv: torch.Tensor, num_heads: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        b, l, _ = qkv.shape
+        head_dim = qkv.shape[-1] // (3 * num_heads)
+        qkv = qkv.view(b, l, 3, num_heads, head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4).contiguous()
+        return qkv[0], qkv[1], qkv[2]
+
+    def _apply_rope(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            xq.is_cuda
+            and xk.is_cuda
+            and xq.dtype == torch.float32
+            and xk.dtype == torch.float32
+            and xq.ndim == 4
+            and xq.shape == xk.shape
+            and freqs_cis.ndim == 6
+            and xq.shape[0] == 1
+            and freqs_cis.shape[0] == 1
+        ):
+            q3 = xq.squeeze(0).permute(1, 0, 2).contiguous()
+            k3 = xk.squeeze(0).permute(1, 0, 2).contiguous()
+            cos = freqs_cis[0, 0, :, :, 0, 0].contiguous()
+            sin = freqs_cis[0, 0, :, :, 1, 0].contiguous()
+            q3 = ns.rope_2d_offset_(q3, cos, sin, 0, q3.shape[0])
+            k3 = ns.rope_2d_offset_(k3, cos, sin, 0, k3.shape[0])
+            return q3.permute(1, 0, 2).unsqueeze(0), k3.permute(1, 0, 2).unsqueeze(0)
+        xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
+        xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
+        xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
+        xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
+        return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+
+    def _attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pe: torch.Tensor) -> torch.Tensor:
+        q, k = _apply_rope(q, k, pe)
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
+            x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        return rearrange(x, "B H L D -> B L (H D)")
+
+    def _qk_norm(module: Any, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            q.is_cuda
+            and k.is_cuda
+            and q.dtype == torch.float32
+            and k.dtype == torch.float32
+            and q.shape == k.shape
+            and q.ndim == 4
+        ):
+            qn = q.permute(0, 2, 1, 3).reshape(-1, q.shape[1], q.shape[3]).contiguous()
+            kn = k.permute(0, 2, 1, 3).reshape(-1, k.shape[1], k.shape[3]).contiguous()
+            qw = module.query_norm.scale.float().contiguous()
+            kw = module.key_norm.scale.float().contiguous()
+            qn = ns.qk_rms_norm_(qn, kn, qw, kw)
+            q = qn.reshape(q.shape[0], q.shape[2], q.shape[1], q.shape[3]).permute(0, 2, 1, 3).to(v)
+            k = kn.reshape(k.shape[0], k.shape[2], k.shape[1], k.shape[3]).permute(0, 2, 1, 3).to(v)
+            return q, k
+        return module.query_norm(q).to(v), module.key_norm(k).to(v)
+
+    def _silu_mul(x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x.chunk(2, dim=-1)
+        if x1.is_cuda and x1.dtype == torch.float32 and x1.shape == x2.shape:
+            return ns.silu_mul_(x1, x2)
+        return torch.nn.functional.silu(x1) * x2
+
+    def _single_forward(self, x: torch.Tensor, pe: torch.Tensor, mod: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        mod_shift, mod_scale, mod_gate = mod
+        x_mod = self.pre_norm(x)
+        x_mod = x_mod.mul_(1 + mod_scale).add_(mod_shift)
+        fused = self.linear1(x_mod)
+        qkv = fused[..., : 3 * self.hidden_size]
+        mlp = fused[..., 3 * self.hidden_size :]
+        q, k, v = _split_qkv_heads(qkv, self.num_heads)
+        q, k = _qk_norm(self.norm, q, k, v)
+        attn = _attention(q, k, v, pe)
+        output = self.linear2(torch.cat((attn, _silu_mul(mlp)), dim=-1))
+        return x + mod_gate * output
+
+    def _double_forward(
+        self,
+        img: torch.Tensor,
+        txt: torch.Tensor,
+        pe: torch.Tensor,
+        pe_ctx: torch.Tensor,
+        mod_img: tuple[torch.Tensor, torch.Tensor],
+        mod_txt: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        img_mod1, img_mod2 = mod_img
+        txt_mod1, txt_mod2 = mod_txt
+        img_mod1_shift, img_mod1_scale, img_mod1_gate = img_mod1
+        img_mod2_shift, img_mod2_scale, img_mod2_gate = img_mod2
+        txt_mod1_shift, txt_mod1_scale, txt_mod1_gate = txt_mod1
+        txt_mod2_shift, txt_mod2_scale, txt_mod2_gate = txt_mod2
+
+        img_modulated = self.img_norm1(img)
+        img_modulated = img_modulated.mul_(1 + img_mod1_scale).add_(img_mod1_shift)
+        img_q, img_k, img_v = _split_qkv_heads(self.img_attn.qkv(img_modulated), self.num_heads)
+        img_q, img_k = _qk_norm(self.img_attn.norm, img_q, img_k, img_v)
+
+        txt_modulated = self.txt_norm1(txt)
+        txt_modulated = txt_modulated.mul_(1 + txt_mod1_scale).add_(txt_mod1_shift)
+        txt_q, txt_k, txt_v = _split_qkv_heads(self.txt_attn.qkv(txt_modulated), self.num_heads)
+        txt_q, txt_k = _qk_norm(self.txt_attn.norm, txt_q, txt_k, txt_v)
+
+        q = torch.cat((txt_q, img_q), dim=2)
+        k = torch.cat((txt_k, img_k), dim=2)
+        v = torch.cat((txt_v, img_v), dim=2)
+        pe = torch.cat((pe_ctx, pe), dim=2)
+        attn = _attention(q, k, v, pe)
+        txt_attn, img_attn = attn[:, : txt_q.shape[2]], attn[:, txt_q.shape[2] :]
+
+        img = img + img_mod1_gate * self.img_attn.proj(img_attn)
+        img = img + img_mod2_gate * self.img_mlp(self.img_norm2(img).mul_(1 + img_mod2_scale).add_(img_mod2_shift))
+        txt = txt + txt_mod1_gate * self.txt_attn.proj(txt_attn)
+        txt = txt + txt_mod2_gate * self.txt_mlp(self.txt_norm2(txt).mul_(1 + txt_mod2_scale).add_(txt_mod2_shift))
+        return img, txt
+
+    patched = 0
+    for block in getattr(transformer, "transformer_blocks", []):
+        if hasattr(block, "img_attn") and hasattr(block, "txt_attn"):
+            block.forward = MethodType(_double_forward, block)
+            patched += 1
+    for block in getattr(transformer, "single_transformer_blocks", []):
+        if hasattr(block, "linear1") and hasattr(block, "linear2") and hasattr(block, "norm"):
+            block.forward = MethodType(_single_forward, block)
+            patched += 1
+
+    if patched == 0:
+        raise RuntimeError("No Flux2 blocks were patched; transformer structure did not match expectations")
+    return transformer
 
 
 def enable_klein_c_cuda_backend(
@@ -75,6 +227,27 @@ def build_klein_c_full_backend(
     from klein_c_full_backend import KleinCFullBackend
 
     return KleinCFullBackend(model_dir=model_dir, lib_path=lib_path, use_mmap=use_mmap)
+
+
+def enable_klein_c_full_backend(
+    pipe: Any,
+    *,
+    model_dir: str,
+    lib_path: str | None = None,
+    use_mmap: bool = True,
+) -> Any:
+    """
+    Attach the native klein-cuda-c backend to the pipeline for direct img2img execution.
+
+    This bypasses the Python denoising loop entirely for image-conditioned generation.
+    """
+    backend = build_klein_c_full_backend(
+        model_dir=model_dir,
+        lib_path=lib_path,
+        use_mmap=use_mmap,
+    )
+    pipe._klein_c_full_backend = backend
+    return backend
 
 
 def _parse_steps_mask(mask_text: str, expected_steps: int) -> list[int]:
