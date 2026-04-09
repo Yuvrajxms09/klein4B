@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "../../klein-cuda-c/flux.h"
+#include "../../klein-cuda-c/flux_cuda.h"
 
 typedef struct flux_tokenizer flux_tokenizer;
 typedef struct flux_vae flux_vae_t;
@@ -66,6 +67,11 @@ extern float *flux_transformer_forward_with_multi_refs(
     float timestep);
 
 void *klein_bridge_load(const char *model_dir, int use_mmap) {
+#ifdef USE_CUDA
+    if (!flux_cuda_init() || !flux_cuda_available()) {
+        return NULL;
+    }
+#endif
     flux_ctx *ctx = flux_load_dir(model_dir);
     if (!ctx) return NULL;
     flux_set_mmap(ctx, use_mmap ? 1 : 0);

@@ -12,7 +12,7 @@ fi
 
 make -C "$KLEIN_C_DIR" cuda
 
-cc -shared -fPIC -O3 \
+cc -shared -fPIC -O3 -DUSE_CUDA \
   -I"$KLEIN_C_DIR" \
   "$ROOT_DIR/klein_c_bridge/bridge.c" \
   "$KLEIN_C_DIR"/flux.cuda.o \

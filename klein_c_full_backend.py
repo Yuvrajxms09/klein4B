@@ -66,6 +66,10 @@ class KleinCFullBackend:
         self._ctx = self._init_ctx(model_dir=model_dir, use_mmap=use_mmap)
 
     def _init_ctx(self, model_dir: str, use_mmap: bool) -> ctypes.c_void_p:
+        self._lib.flux_cuda_init.argtypes = []
+        self._lib.flux_cuda_init.restype = ctypes.c_int
+        self._lib.flux_cuda_available.argtypes = []
+        self._lib.flux_cuda_available.restype = ctypes.c_int
         self._lib.flux_load_dir.argtypes = [ctypes.c_char_p]
         self._lib.flux_load_dir.restype = ctypes.c_void_p
         self._lib.flux_free.argtypes = [ctypes.c_void_p]
@@ -96,6 +100,10 @@ class KleinCFullBackend:
         self._lib.flux_image_create.restype = ctypes.POINTER(FluxImage)
         self._lib.flux_image_free.argtypes = [ctypes.POINTER(FluxImage)]
         self._lib.flux_image_free.restype = None
+
+        cuda_ok = int(self._lib.flux_cuda_init())
+        if cuda_ok != 1 or int(self._lib.flux_cuda_available()) != 1:
+            raise RuntimeError("CUDA backend not available in loaded klein-cuda-c library")
 
         ctx = self._lib.flux_load_dir(model_dir.encode("utf-8"))
         if not ctx:
