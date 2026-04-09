@@ -43,7 +43,7 @@ def load_ported_cuda_kernels(module_name: str = "klein_cuda_ext") -> Any:
     return ns
 
 
-def apply_flux2_transformer_klein_ops(transformer: Any) -> Any:
+def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False) -> Any:
     """
     Patch an in-memory Flux2 transformer instance to use the local CUDA-backed
     optimization helpers where possible.
@@ -65,6 +65,15 @@ def apply_flux2_transformer_klein_ops(transformer: Any) -> Any:
         qkv = qkv.view(b, l, 3, num_heads, head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4).contiguous()
         return qkv[0], qkv[1], qkv[2]
+
+    def _split_modulation(mod: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        parts = mod.chunk(6, dim=-1)
+        first = parts[:3]
+        second = parts[3:]
+        if first[0].ndim == 2:
+            first = tuple(t[:, None, :] for t in first)
+            second = tuple(t[:, None, :] for t in second)
+        return first, second
 
     def _apply_rope(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if (
@@ -135,6 +144,42 @@ def apply_flux2_transformer_klein_ops(transformer: Any) -> Any:
         output = self.linear2(torch.cat((attn, _silu_mul(mlp)), dim=-1))
         return x + mod_gate * output
 
+    def _single_forward_diffusers(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None,
+        temb_mod: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
+        split_hidden_states: bool = False,
+        text_seq_len: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        if verbose:
+            print("[klein] single block", type(self).__name__, "hidden", tuple(hidden_states.shape))
+        if encoder_hidden_states is not None:
+            text_seq_len = encoder_hidden_states.shape[1]
+            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        mod_shift, mod_scale, mod_gate = temb_mod.chunk(3, dim=-1)
+        if mod_shift.ndim == 2:
+            mod_shift = mod_shift[:, None, :]
+            mod_scale = mod_scale[:, None, :]
+            mod_gate = mod_gate[:, None, :]
+        norm_hidden_states = self.norm(hidden_states)
+        norm_hidden_states = (1 + mod_scale) * norm_hidden_states + mod_shift
+        attn_output = self.attn(
+            hidden_states=norm_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+            **joint_attention_kwargs,
+        )
+        hidden_states = hidden_states + mod_gate * attn_output
+        if hidden_states.dtype == torch.float16:
+            hidden_states = hidden_states.clip(-65504, 65504)
+        if split_hidden_states:
+            encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
+            return encoder_hidden_states, hidden_states
+        return hidden_states
+
     def _double_forward(
         self,
         img: torch.Tensor,
@@ -174,14 +219,57 @@ def apply_flux2_transformer_klein_ops(transformer: Any) -> Any:
         txt = txt + txt_mod2_gate * self.txt_mlp(self.txt_norm2(txt).mul_(1 + txt_mod2_scale).add_(txt_mod2_shift))
         return img, txt
 
+    def _double_forward_diffusers(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb_mod_img: torch.Tensor,
+        temb_mod_txt: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        if verbose:
+            print("[klein] double block", type(self).__name__, "img", tuple(hidden_states.shape), "txt", tuple(encoder_hidden_states.shape))
+        (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = _split_modulation(temb_mod_img)
+        (c_shift_msa, c_scale_msa, c_gate_msa), (c_shift_mlp, c_scale_mlp, c_gate_mlp) = _split_modulation(temb_mod_txt)
+
+        norm_hidden_states = self.norm1(hidden_states)
+        norm_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
+        norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
+        norm_encoder_hidden_states = (1 + c_scale_msa) * norm_encoder_hidden_states + c_shift_msa
+
+        # Use the existing attention module, but keep the block math and projections in-place.
+        attn_hidden, attn_context = self.attn(
+            hidden_states=norm_hidden_states,
+            encoder_hidden_states=norm_encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+            **joint_attention_kwargs,
+        )
+
+        hidden_states = hidden_states + gate_msa * attn_hidden
+        norm_hidden_states = self.norm2(hidden_states)
+        norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+        ff_output = self.ff(norm_hidden_states)
+        hidden_states = hidden_states + gate_mlp * ff_output
+
+        encoder_hidden_states = encoder_hidden_states + c_gate_msa * attn_context
+        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+        norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp) + c_shift_mlp
+        context_ff_output = self.ff_context(norm_encoder_hidden_states)
+        encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
+        if encoder_hidden_states.dtype == torch.float16:
+            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+        return encoder_hidden_states, hidden_states
+
     patched = 0
     for block in getattr(transformer, "transformer_blocks", []):
-        if hasattr(block, "img_attn") and hasattr(block, "txt_attn"):
-            block.forward = MethodType(_double_forward, block)
+        if hasattr(block, "attn") and hasattr(block, "ff") and hasattr(block, "ff_context"):
+            block.forward = MethodType(_double_forward_diffusers, block)
             patched += 1
     for block in getattr(transformer, "single_transformer_blocks", []):
-        if hasattr(block, "linear1") and hasattr(block, "linear2") and hasattr(block, "norm"):
-            block.forward = MethodType(_single_forward, block)
+        if hasattr(block, "attn") and hasattr(block, "norm"):
+            block.forward = MethodType(_single_forward_diffusers, block)
             patched += 1
 
     if patched == 0:
