@@ -436,12 +436,28 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                     pe = image_rotary_emb[0]
                     q_hidden, k_hidden = _apply_rope(q_hidden, k_hidden, pe)
                     q_context, k_context = _apply_rope(q_context, k_context, pe_ctx)
-                hidden_attn = _packed_attention_call(q_hidden, k_hidden, v_hidden)
-                context_attn = _packed_attention_call(q_context, k_context, v_context)
-                if hidden_attn is not None and context_attn is not None:
-                    attn_hidden = hidden_attn
-                    attn_context = context_attn
-                else:
+                if hasattr(ns, "joint_packed_attention_"):
+                    try:
+                        attn_hidden, attn_context = ns.joint_packed_attention_(
+                            q_hidden,
+                            k_hidden,
+                            v_hidden,
+                            q_context,
+                            k_context,
+                            v_context,
+                            1.0 / (q_hidden.shape[-1] ** 0.5),
+                        )
+                    except Exception:
+                        attn_hidden = None
+                        attn_context = None
+                if attn_hidden is None or attn_context is None:
+                    hidden_attn = _packed_attention_call(q_hidden, k_hidden, v_hidden)
+                    context_attn = _packed_attention_call(q_context, k_context, v_context)
+                    if attn_hidden is None and hidden_attn is not None:
+                        attn_hidden = hidden_attn
+                    if attn_context is None and context_attn is not None:
+                        attn_context = context_attn
+                if attn_hidden is None or attn_context is None:
                     q = torch.cat((q_context, q_hidden), dim=2)
                     k = torch.cat((k_context, k_hidden), dim=2)
                     v = torch.cat((v_context, v_hidden), dim=2)
