@@ -427,7 +427,7 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                 if image_rotary_emb is not None:
                     pe = image_rotary_emb[0]
                     q_hidden, k_hidden = _apply_rope(q_hidden, k_hidden, pe)
-                    q_context, k_context = _apply_rope(q_context, k_context, pe_ctx)
+                    q_context, k_context = _apply_rope(q_context, k_context, pe)
                 if hasattr(ns, "joint_packed_attention_"):
                     try:
                         logger.info(
