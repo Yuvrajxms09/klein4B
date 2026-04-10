@@ -404,20 +404,12 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         joint_attention_kwargs = joint_attention_kwargs or {}
-        img_attn = self.img_attn
-        txt_attn = self.txt_attn
-        img_norm1 = self.img_norm1
-        txt_norm1 = self.txt_norm1
-        img_norm2 = self.img_norm2
-        txt_norm2 = self.txt_norm2
-        img_mlp = self.img_mlp
-        txt_mlp = self.txt_mlp
         if verbose:
             print("[klein] double block", type(self).__name__, "img", tuple(hidden_states.shape), "txt", tuple(encoder_hidden_states.shape))
         (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = _split_modulation(temb_mod_img)
         (c_shift_msa, c_scale_msa, c_gate_msa), (c_shift_mlp, c_scale_mlp, c_gate_mlp) = _split_modulation(temb_mod_txt)
 
-        norm_hidden_states = _adaln(img_norm1, hidden_states, shift_msa, scale_msa)
+        norm_hidden_states = _adaln(self.norm1, hidden_states, shift_msa, scale_msa)
         norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
         norm_encoder_hidden_states = _adaln(self.norm1_context, encoder_hidden_states, c_shift_msa, c_scale_msa)
 
