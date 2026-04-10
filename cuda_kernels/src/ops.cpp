@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <cstdio>
 #include <vector>
 
 torch::Tensor silu_mul_cuda_(torch::Tensor gate, torch::Tensor up);
@@ -33,6 +34,7 @@ std::vector<torch::Tensor> joint_packed_attention_cuda_(
     double scale);
 
 torch::Tensor silu_mul_(torch::Tensor gate, torch::Tensor up) {
+    fprintf(stderr, "[klein_cuda] silu_mul_\n");
     TORCH_CHECK(gate.is_cuda(), "gate must be CUDA tensor");
     TORCH_CHECK(up.is_cuda(), "up must be CUDA tensor");
     TORCH_CHECK(gate.scalar_type() == torch::kFloat32, "gate must be float32");
@@ -42,6 +44,7 @@ torch::Tensor silu_mul_(torch::Tensor gate, torch::Tensor up) {
 }
 
 torch::Tensor adaln_norm(torch::Tensor x, torch::Tensor shift, torch::Tensor scale, double eps) {
+    fprintf(stderr, "[klein_cuda] adaln_norm\n");
     TORCH_CHECK(x.is_cuda(), "x must be CUDA tensor");
     TORCH_CHECK(shift.is_cuda(), "shift must be CUDA tensor");
     TORCH_CHECK(scale.is_cuda(), "scale must be CUDA tensor");
@@ -55,6 +58,7 @@ torch::Tensor adaln_norm(torch::Tensor x, torch::Tensor shift, torch::Tensor sca
 }
 
 torch::Tensor qk_rms_norm_(torch::Tensor q, torch::Tensor k, torch::Tensor qw, torch::Tensor kw, double eps) {
+    fprintf(stderr, "[klein_cuda] qk_rms_norm_\n");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && qw.is_cuda() && kw.is_cuda(), "all tensors must be CUDA");
     TORCH_CHECK(q.scalar_type() == torch::kFloat32, "q must be float32");
     TORCH_CHECK(k.scalar_type() == torch::kFloat32, "k must be float32");
@@ -69,6 +73,7 @@ torch::Tensor qk_rms_norm_(torch::Tensor q, torch::Tensor k, torch::Tensor qw, t
 }
 
 torch::Tensor rope_2d_offset_(torch::Tensor x, torch::Tensor cos, torch::Tensor sin, int64_t seq_offset, int64_t seq_len) {
+    fprintf(stderr, "[klein_cuda] rope_2d_offset_ seq_offset=%ld seq_len=%ld\n", (long)seq_offset, (long)seq_len);
     TORCH_CHECK(x.is_cuda() && cos.is_cuda() && sin.is_cuda(), "all tensors must be CUDA");
     TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
     TORCH_CHECK(cos.scalar_type() == torch::kFloat32, "cos must be float32");
@@ -85,6 +90,7 @@ torch::Tensor rope_2d_offset_(torch::Tensor x, torch::Tensor cos, torch::Tensor 
 }
 
 torch::Tensor packed_attention_(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale) {
+    fprintf(stderr, "[klein_cuda] packed_attention_ scale=%f\n", scale);
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "all tensors must be CUDA");
     TORCH_CHECK(q.scalar_type() == torch::kFloat32, "q must be float32");
     TORCH_CHECK(k.scalar_type() == torch::kFloat32, "k must be float32");
@@ -104,6 +110,7 @@ torch::Tensor fused_qkv_attention_(
     int64_t seq_offset,
     int64_t seq_len,
     double scale) {
+    fprintf(stderr, "[klein_cuda] fused_qkv_attention_ seq_offset=%ld seq_len=%ld scale=%f\n", (long)seq_offset, (long)seq_len, scale);
     TORCH_CHECK(qkv.is_cuda(), "qkv must be CUDA tensor");
     TORCH_CHECK(qkv.scalar_type() == torch::kFloat32, "qkv must be float32");
     TORCH_CHECK(qkv.dim() == 4 && qkv.size(2) == 3, "qkv must be [seq, heads, 3, head_dim]");
@@ -119,6 +126,7 @@ std::vector<torch::Tensor> joint_packed_attention_(
     torch::Tensor k_context,
     torch::Tensor v_context,
     double scale) {
+    fprintf(stderr, "[klein_cuda] joint_packed_attention_ scale=%f\n", scale);
     TORCH_CHECK(q_hidden.is_cuda() && k_hidden.is_cuda() && v_hidden.is_cuda(), "hidden tensors must be CUDA");
     TORCH_CHECK(q_context.is_cuda() && k_context.is_cuda() && v_context.is_cuda(), "context tensors must be CUDA");
     TORCH_CHECK(q_hidden.scalar_type() == torch::kFloat32, "q_hidden must be float32");

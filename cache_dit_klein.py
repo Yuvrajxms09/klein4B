@@ -438,6 +438,13 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                     q_context, k_context = _apply_rope(q_context, k_context, pe_ctx)
                 if hasattr(ns, "joint_packed_attention_"):
                     try:
+                        logger.info(
+                            "double_stream_joint_packed_attention seq_hidden=%s seq_context=%s heads=%s head_dim=%s",
+                            q_hidden.shape[0],
+                            q_context.shape[0],
+                            q_hidden.shape[1],
+                            q_hidden.shape[2],
+                        )
                         attn_hidden, attn_context = ns.joint_packed_attention_(
                             q_hidden,
                             k_hidden,
@@ -448,9 +455,11 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                             1.0 / (q_hidden.shape[-1] ** 0.5),
                         )
                     except Exception:
+                        logger.info("double_stream_joint_packed_attention fallback_to_per_stream")
                         attn_hidden = None
                         attn_context = None
                 if attn_hidden is None or attn_context is None:
+                    logger.info("double_stream_per_stream_packed_attention")
                     hidden_attn = _packed_attention_call(q_hidden, k_hidden, v_hidden)
                     context_attn = _packed_attention_call(q_context, k_context, v_context)
                     if attn_hidden is None and hidden_attn is not None:
@@ -458,6 +467,7 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                     if attn_context is None and context_attn is not None:
                         attn_context = context_attn
                 if attn_hidden is None or attn_context is None:
+                    logger.info("double_stream_generic_joint_attention_fallback")
                     q = torch.cat((q_context, q_hidden), dim=2)
                     k = torch.cat((k_context, k_hidden), dim=2)
                     v = torch.cat((v_context, v_hidden), dim=2)
@@ -869,22 +879,27 @@ def prepare_transformer_for_speed(
             from cuda_kernels import is_loaded, load_compiled_extension
 
             if not is_loaded():
+                logger.info("loading klein CUDA extension")
                 load_compiled_extension()
+            logger.info("applying klein CUDA block patches")
             apply_flux2_transformer_klein_ops(pipe.transformer, verbose=False)
         except Exception as exc:
             logger.warning("klein CUDA block patch unavailable, using diffusers path: %s", exc)
     if fuse_qkv and hasattr(pipe.transformer, "fuse_qkv_projections"):
         try:
+            logger.info("fusing transformer qkv projections")
             pipe.transformer.fuse_qkv_projections()
             setattr(pipe.transformer, "_is_qkv_fused", True)
         except Exception as exc:
             logger.warning("transformer qkv fusion failed, continuing without it: %s", exc)
     try:
+        logger.info("fusing double-stream projection stacks")
         fused_blocks = fuse_flux2_double_stream_attention_projections(pipe.transformer)
         if fused_blocks == 0:
             logger.info("no flux2 double-stream projections were fused")
     except Exception as exc:
         logger.warning("double-stream projection fusion failed, continuing without it: %s", exc)
+    logger.info("selecting attention backend backend=%s", backend)
     return apply_attention_backend(pipe, backend)
 
 
