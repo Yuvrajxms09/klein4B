@@ -288,13 +288,13 @@ __global__ void k_packed_attention(
             prev_rowmax = rowmax;
             score = partials[0] * scaled;
             if (score > rowmax) {
-                rescale = __exp2f(rowmax - score);
+                rescale = exp2f(rowmax - score);
                 weight = 1.0f;
                 rowsum = rowsum * rescale + 1.0f;
                 rowmax = score;
             } else {
                 rescale = 1.0f;
-                weight = __exp2f(score - rowmax);
+                weight = exp2f(score - rowmax);
                 rowsum += weight;
             }
         }
