@@ -11,6 +11,18 @@ import modal
 
 
 APP = modal.App("klein4b-modal-cuda")
+DEFAULT_BENCHMARK_PROMPTS: tuple[str, ...] = (
+    "on a top",
+    "on a bike",
+    "on a mountain road",
+    "in a rainy city at night",
+    "under golden sunset light",
+    "in a snowy forest",
+    "with a cinematic teal and orange look",
+    "as a watercolor painting",
+    "as a realistic product photo",
+    "with dramatic studio lighting",
+)
 
 
 def _repo_root() -> str:
@@ -125,6 +137,14 @@ def _save_images(*, images, prompts, base_dir: Path, volume: modal.Volume, volum
     return run_dir
 
 
+def _print_benchmark_header(*, prompts: list[str], warmup_runs: int, num_inference_steps: int, guidance_scale: float) -> None:
+    print("benchmark_config:")
+    print(f"  prompts={len(prompts)}")
+    print(f"  warmup_runs={warmup_runs}")
+    print(f"  num_inference_steps={num_inference_steps}")
+    print(f"  guidance_scale={guidance_scale}")
+
+
 @APP.function(
     image=image,
     gpu="RTX-PRO-6000",
@@ -186,7 +206,7 @@ def build_and_run(
     if not Path(image_path).exists():
         raise FileNotFoundError(f"image_path not found: {image_path}")
 
-    prompt_list = list(prompts) if prompts is not None else ["a blue car on a mountain road at sunset"]
+    prompt_list = list(prompts) if prompts is not None else list(DEFAULT_BENCHMARK_PROMPTS)
     input_image = Image.open(image_path).convert("RGB").resize((width, height))
 
     dtype = torch.bfloat16
@@ -218,6 +238,13 @@ def build_and_run(
     torch._inductor.config.coordinate_descent_tuning = True
     torch._inductor.config.coordinate_descent_check_all_directions = True
     torch._inductor.config.epilogue_fusion = False
+
+    _print_benchmark_header(
+        prompts=prompt_list,
+        warmup_runs=warmup_runs,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+    )
 
     pipe.transformer = torch.compile(pipe.transformer, mode="max-autotune", fullgraph=False, dynamic=False)
 
