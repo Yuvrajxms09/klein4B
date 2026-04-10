@@ -219,17 +219,11 @@ def build_and_run(
     torch._inductor.config.coordinate_descent_check_all_directions = True
     torch._inductor.config.epilogue_fusion = False
 
-    pipe.transformer = torch.compile(pipe.transformer, mode="max-autotune", fullgraph=False, dynamic=False)
-
     def _vae_encode_fn(image: torch.Tensor, generator: torch.Generator):
         return pipe._encode_vae_image(image=image, generator=generator)
 
-    pipe._vae_encode_fn = torch.compile(_vae_encode_fn, mode="max-autotune", fullgraph=False, dynamic=False)
-
     def _vae_decode_fn(latents: torch.Tensor):
         return pipe.vae.decode(latents, return_dict=False)[0]
-
-    pipe._vae_decode_fn = torch.compile(_vae_decode_fn, mode="max-autotune", fullgraph=False, dynamic=False)
 
     warmup_times: list[float] = []
     for i in range(warmup_runs):

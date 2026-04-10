@@ -133,13 +133,15 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
             return None
         if not (q.is_cuda and k.is_cuda and v.is_cuda):
             return None
-        if q.shape[0] != 1:
-            return None
         if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
             return None
-        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
-            return None
         if q.shape != k.shape or q.shape != v.shape:
+            return None
+        if q.ndim == 4 and q.shape[0] == 1:
+            q = q.squeeze(0).permute(1, 0, 2).contiguous()
+            k = k.squeeze(0).permute(1, 0, 2).contiguous()
+            v = v.squeeze(0).permute(1, 0, 2).contiguous()
+        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
             return None
         if q.shape[-1] > 128:
             return None
@@ -148,26 +150,31 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
     def _seq_major_from_batched_qkv(qkv: torch.Tensor) -> torch.Tensor:
         if qkv.ndim != 5 or qkv.shape[2] != 3:
             raise ValueError(f"expected [batch, seq, 3, heads, head_dim], got {tuple(qkv.shape)}")
-        return qkv.reshape(qkv.shape[0] * qkv.shape[1], qkv.shape[3], 3, qkv.shape[4]).contiguous()
+        if qkv.shape[0] != 1:
+            raise ValueError(f"packed fused attention only supports batch=1, got {qkv.shape[0]}")
+        return qkv.squeeze(0).permute(0, 2, 1, 3).contiguous()
 
     def _seq_major_from_bhq(x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 4:
             raise ValueError(f"expected [batch, heads, seq, head_dim], got {tuple(x.shape)}")
-        return x.permute(0, 2, 1, 3).reshape(x.shape[0] * x.shape[2], x.shape[1], x.shape[3]).contiguous()
+        if x.shape[0] != 1:
+            raise ValueError(f"packed attention only supports batch=1, got {x.shape[0]}")
+        return x.squeeze(0).permute(1, 0, 2).contiguous()
 
     def _bhq_from_seq_major(x: torch.Tensor, batch: int, seq: int) -> torch.Tensor:
         return x.reshape(batch, seq, x.shape[1], x.shape[2]).contiguous()
 
     def _flatten_attention_output(x: torch.Tensor) -> torch.Tensor:
         if x.ndim == 3:
-            return x.reshape(x.shape[0], x.shape[1], -1).contiguous()
+            return x.reshape(1, x.shape[0], -1).contiguous()
         if x.ndim == 4:
             return x.permute(0, 2, 1, 3).reshape(x.shape[0], x.shape[2], -1).contiguous()
         raise ValueError(f"unexpected attention output rank: {x.ndim}")
 
     def _attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        if _has_op("packed_attention_") and q.is_cuda and k.is_cuda and v.is_cuda and q.dtype == torch.float32:
-            return ns.packed_attention_(q, k, v, 1.0 / (q.shape[-1] ** 0.5))
+        packed = _packed_attention_call(q, k, v)
+        if packed is not None:
+            return packed
         return torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
     def _qk_norm(module: Any, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -202,8 +209,7 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         try:
             qw = module.query_norm.scale.to(dtype=torch.float32, copy=False)
             kw = module.key_norm.scale.to(dtype=torch.float32, copy=False)
-            b, l, _, h, d = qkv.shape
-            qkv3 = qkv.reshape(b * l, h, 3, d).contiguous()
+            qkv3 = _seq_major_from_batched_qkv(qkv)
             q, k, v = ns.fused_qkv_rope_qk_norm_(
                 qkv3,
                 qw,
@@ -281,13 +287,13 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
             try:
                 attn = _flatten_attention_output(
                     ns.fused_qkv_attention_(
-                    fused_qkv.reshape(fused_qkv.shape[0] * fused_qkv.shape[1], self.num_heads, 3, fused_qkv.shape[-1]).contiguous(),
+                    _seq_major_from_batched_qkv(fused_qkv),
                     self.norm.query_norm.scale.to(dtype=torch.float32, copy=False),
                     self.norm.key_norm.scale.to(dtype=torch.float32, copy=False),
                     pe[0, 0, :, :, 0, 0].contiguous(),
                     pe[0, 0, :, :, 1, 0].contiguous(),
                     0,
-                    fused_qkv.shape[0] * fused_qkv.shape[1],
+                    fused_qkv.shape[1],
                     1.0 / (fused_qkv.shape[-1] ** 0.5),
                     )
                 )
@@ -420,13 +426,15 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         (c_shift_msa, c_scale_msa, c_gate_msa), (c_shift_mlp, c_scale_mlp, c_gate_mlp) = _split_modulation(temb_mod_txt)
 
         norm_hidden_states = _adaln(self.norm1, hidden_states, shift_msa, scale_msa)
-        norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
         norm_encoder_hidden_states = _adaln(self.norm1_context, encoder_hidden_states, c_shift_msa, c_scale_msa)
 
         # Use packed attention when the Flux block exposes qkv modules; otherwise fall back.
         attn_hidden = None
         attn_context = None
-        if hasattr(self, "qkv") and hasattr(self, "qkv_context") and hasattr(self, "proj"):
+        if all(
+            hasattr(self, name)
+            for name in ("qkv", "qkv_context", "proj", "img_attn", "txt_attn", "ff", "ff_context")
+        ):
             try:
                 qkv_hidden = self.qkv(norm_hidden_states)
                 qkv_context = self.qkv_context(norm_encoder_hidden_states)
@@ -440,21 +448,27 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                     q_context, k_context = _apply_rope(q_context, k_context, pe)
                 if hasattr(ns, "joint_packed_attention_"):
                     try:
+                        q_hidden_3d = _seq_major_from_bhq(q_hidden)
+                        k_hidden_3d = _seq_major_from_bhq(k_hidden)
+                        v_hidden_3d = _seq_major_from_bhq(v_hidden)
+                        q_context_3d = _seq_major_from_bhq(q_context)
+                        k_context_3d = _seq_major_from_bhq(k_context)
+                        v_context_3d = _seq_major_from_bhq(v_context)
                         logger.info(
                             "double_stream_joint_packed_attention seq_hidden=%s seq_context=%s heads=%s head_dim=%s",
-                            q_hidden.shape[0],
-                            q_context.shape[0],
-                            q_hidden.shape[1],
-                            q_hidden.shape[2],
+                            q_hidden_3d.shape[0],
+                            q_context_3d.shape[0],
+                            q_hidden_3d.shape[1],
+                            q_hidden_3d.shape[2],
                         )
                         attn_hidden, attn_context = ns.joint_packed_attention_(
-                            q_hidden,
-                            k_hidden,
-                            v_hidden,
-                            q_context,
-                            k_context,
-                            v_context,
-                            1.0 / (q_hidden.shape[-1] ** 0.5),
+                            q_hidden_3d,
+                            k_hidden_3d,
+                            v_hidden_3d,
+                            q_context_3d,
+                            k_context_3d,
+                            v_context_3d,
+                            1.0 / (q_hidden_3d.shape[-1] ** 0.5),
                         )
                         attn_hidden = _flatten_attention_output(attn_hidden)
                         attn_context = _flatten_attention_output(attn_context)
