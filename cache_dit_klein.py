@@ -432,17 +432,25 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                 q_context, k_context, v_context = _split_qkv_heads(qkv_context, self.num_heads)
                 q_hidden, k_hidden = _qk_norm(self.img_attn.norm, q_hidden, k_hidden, v_hidden)
                 q_context, k_context = _qk_norm(self.txt_attn.norm, q_context, k_context, v_context)
-                q = torch.cat((q_context, q_hidden), dim=2)
-                k = torch.cat((k_context, k_hidden), dim=2)
-                v = torch.cat((v_context, v_hidden), dim=2)
                 if image_rotary_emb is not None:
                     pe = image_rotary_emb[0]
-                    q, k = _apply_rope(q, k, pe)
-                attn = _packed_attention_call(q, k, v)
-                if attn is None:
+                    q_hidden, k_hidden = _apply_rope(q_hidden, k_hidden, pe)
+                    q_context, k_context = _apply_rope(q_context, k_context, pe_ctx)
+                hidden_attn = _packed_attention_call(q_hidden, k_hidden, v_hidden)
+                context_attn = _packed_attention_call(q_context, k_context, v_context)
+                if hidden_attn is not None and context_attn is not None:
+                    attn_hidden = hidden_attn
+                    attn_context = context_attn
+                else:
+                    q = torch.cat((q_context, q_hidden), dim=2)
+                    k = torch.cat((k_context, k_hidden), dim=2)
+                    v = torch.cat((v_context, v_hidden), dim=2)
+                    if image_rotary_emb is not None:
+                        pe = image_rotary_emb[0]
+                        q, k = _apply_rope(q, k, pe)
                     attn = _attention(q, k, v)
-                attn_context = attn[:, :, : q_context.shape[2]]
-                attn_hidden = attn[:, :, q_context.shape[2] :]
+                    attn_context = attn[:, :, : q_context.shape[2]]
+                    attn_hidden = attn[:, :, q_context.shape[2] :]
             except Exception:
                 attn_hidden = None
                 attn_context = None
