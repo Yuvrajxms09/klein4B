@@ -12,6 +12,7 @@ backend > transformer compile (after warmup).
 
 from __future__ import annotations
 
+import logging
 import torch
 from typing import Any
 from types import MethodType
@@ -22,6 +23,9 @@ try:
     from einops import rearrange
 except Exception:  # pragma: no cover - optional dependency in some envs
     rearrange = None
+
+
+logger = logging.getLogger(__name__)
 
 
 def latent_token_count_for_resolution(pipe: Any, height: int, width: int) -> int:
@@ -129,6 +133,8 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
             return None
         if not (q.is_cuda and k.is_cuda and v.is_cuda):
             return None
+        if q.shape[0] != 1:
+            return None
         if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
             return None
         if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
@@ -214,6 +220,8 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
             return None
         if not (qkv.is_cuda and qkv.dtype == torch.float32 and qkv.ndim == 5 and qkv.shape[2] == 3):
             return None
+        if qkv.shape[0] != 1:
+            return None
         try:
             qw = module.query_norm.scale.to(dtype=torch.float32, copy=False)
             kw = module.key_norm.scale.to(dtype=torch.float32, copy=False)
@@ -264,20 +272,21 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         fused = _fused_qkv_rope_qk_norm(fused_qkv, self.norm, pe)
         if fused is not None:
             q, k, v = fused
+            q_for_attention = q
+            k_for_attention = k
+            v_for_attention = v
         else:
             q, k, v = _split_qkv_heads(qkv, self.num_heads)
             q, k = _qk_norm(self.norm, q, k, v)
             q, k = _apply_rope(q, k, pe)
-            q = _seq_major_from_bhq(q)
-            k = _seq_major_from_bhq(k)
-            v = _seq_major_from_bhq(v)
-        attn = _packed_attention_call(q, k, v)
+            q_for_attention = q
+            k_for_attention = k
+            v_for_attention = v
+        attn = _packed_attention_call(q_for_attention, k_for_attention, v_for_attention)
         if attn is None:
-            attn = _attention(q, k, v)
+            attn = _attention(q_for_attention, k_for_attention, v_for_attention)
         if attn is None:
             raise RuntimeError("attention path unexpectedly failed")
-        if attn.ndim == 3:
-            attn = _bhq_from_seq_major(attn, x.shape[0], x.shape[1]).reshape(x.shape[0], x.shape[1], -1)
         mlp_act = _silu_mul(mlp)
         fused = torch.cat((attn, mlp_act), dim=-1)
         output = self.linear2(fused)
@@ -338,40 +347,36 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
 
         img_modulated = self.img_norm1(img)
         img_modulated = img_modulated.mul_(1 + img_mod1_scale).add_(img_mod1_shift)
-        img_qkv = self.img_attn.qkv(img_modulated).view(img_modulated.shape[0], img_modulated.shape[1], 3, self.num_heads, self.img_attn.qkv.out_features // (3 * self.num_heads)).contiguous()
+        img_qkv = self.img_attn.qkv(img_modulated).view(
+            img_modulated.shape[0], img_modulated.shape[1], 3, self.num_heads, self.img_attn.qkv.out_features // (3 * self.num_heads)
+        ).contiguous()
         fused_img = _fused_qkv_rope_qk_norm(img_qkv, self.img_attn.norm, pe)
         if fused_img is None:
             img_q, img_k, img_v = _split_qkv_heads(self.img_attn.qkv(img_modulated), self.num_heads)
             img_q, img_k = _qk_norm(self.img_attn.norm, img_q, img_k, img_v)
             img_q, img_k = _apply_rope(img_q, img_k, pe)
-            img_q = _seq_major_from_bhq(img_q)
-            img_k = _seq_major_from_bhq(img_k)
-            img_v = _seq_major_from_bhq(img_v)
         else:
             img_q, img_k, img_v = fused_img
 
         txt_modulated = self.txt_norm1(txt)
         txt_modulated = txt_modulated.mul_(1 + txt_mod1_scale).add_(txt_mod1_shift)
-        txt_qkv = self.txt_attn.qkv(txt_modulated).view(txt_modulated.shape[0], txt_modulated.shape[1], 3, self.num_heads, self.txt_attn.qkv.out_features // (3 * self.num_heads)).contiguous()
+        txt_qkv = self.txt_attn.qkv(txt_modulated).view(
+            txt_modulated.shape[0], txt_modulated.shape[1], 3, self.num_heads, self.txt_attn.qkv.out_features // (3 * self.num_heads)
+        ).contiguous()
         fused_txt = _fused_qkv_rope_qk_norm(txt_qkv, self.txt_attn.norm, pe_ctx)
         if fused_txt is None:
             txt_q, txt_k, txt_v = _split_qkv_heads(self.txt_attn.qkv(txt_modulated), self.num_heads)
             txt_q, txt_k = _qk_norm(self.txt_attn.norm, txt_q, txt_k, txt_v)
             txt_q, txt_k = _apply_rope(txt_q, txt_k, pe_ctx)
-            txt_q = _seq_major_from_bhq(txt_q)
-            txt_k = _seq_major_from_bhq(txt_k)
-            txt_v = _seq_major_from_bhq(txt_v)
         else:
             txt_q, txt_k, txt_v = fused_txt
 
-        q = torch.cat((txt_q, img_q), dim=0)
-        k = torch.cat((txt_k, img_k), dim=0)
-        v = torch.cat((txt_v, img_v), dim=0)
+        q = torch.cat((txt_q, img_q), dim=2)
+        k = torch.cat((txt_k, img_k), dim=2)
+        v = torch.cat((txt_v, img_v), dim=2)
         attn = _attention(q, k, v)
-        txt_attn = attn[: txt_q.shape[0]]
-        img_attn = attn[txt_q.shape[0] :]
-        txt_attn = _bhq_from_seq_major(txt_attn, txt_modulated.shape[0], txt_modulated.shape[1])
-        img_attn = _bhq_from_seq_major(img_attn, img_modulated.shape[0], img_modulated.shape[1])
+        txt_attn = attn[:, :, : txt_q.shape[2]]
+        img_attn = attn[:, :, txt_q.shape[2] :]
 
         img = img + img_mod1_gate * self.img_attn.proj(img_attn)
         img = img + img_mod2_gate * self.img_mlp(self.img_norm2(img).mul_(1 + img_mod2_scale).add_(img_mod2_shift))
@@ -417,23 +422,17 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                 q_context, k_context, v_context = _split_qkv_heads(qkv_context, self.num_heads)
                 q_hidden, k_hidden = _qk_norm(self.img_attn.norm, q_hidden, k_hidden, v_hidden)
                 q_context, k_context = _qk_norm(self.txt_attn.norm, q_context, k_context, v_context)
-                q = torch.cat((_seq_major_from_bhq(q_context), _seq_major_from_bhq(q_hidden)), dim=0)
-                k = torch.cat((_seq_major_from_bhq(k_context), _seq_major_from_bhq(k_hidden)), dim=0)
-                v = torch.cat((_seq_major_from_bhq(v_context), _seq_major_from_bhq(v_hidden)), dim=0)
+                q = torch.cat((q_context, q_hidden), dim=2)
+                k = torch.cat((k_context, k_hidden), dim=2)
+                v = torch.cat((v_context, v_hidden), dim=2)
                 if image_rotary_emb is not None:
                     pe = image_rotary_emb[0]
                     q, k = _apply_rope(q, k, pe)
                 attn = _packed_attention_call(q, k, v)
                 if attn is None:
                     attn = _attention(q, k, v)
-                attn_context = attn[: q_context.shape[0]]
-                attn_hidden = attn[q_context.shape[0] :]
-                attn_context = _bhq_from_seq_major(
-                    attn_context, encoder_hidden_states.shape[0], encoder_hidden_states.shape[1]
-                ).reshape(encoder_hidden_states.shape[0], encoder_hidden_states.shape[1], -1)
-                attn_hidden = _bhq_from_seq_major(attn_hidden, hidden_states.shape[0], hidden_states.shape[1]).reshape(
-                    hidden_states.shape[0], hidden_states.shape[1], -1
-                )
+                attn_context = attn[:, :, : q_context.shape[2]]
+                attn_hidden = attn[:, :, q_context.shape[2] :]
             except Exception:
                 attn_hidden = None
                 attn_context = None
@@ -838,18 +837,20 @@ def prepare_transformer_for_speed(
             if not is_loaded():
                 load_compiled_extension()
             apply_flux2_transformer_klein_ops(pipe.transformer, verbose=False)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("klein CUDA block patch unavailable, using diffusers path: %s", exc)
     if fuse_qkv and hasattr(pipe.transformer, "fuse_qkv_projections"):
         try:
             pipe.transformer.fuse_qkv_projections()
             setattr(pipe.transformer, "_is_qkv_fused", True)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("transformer qkv fusion failed, continuing without it: %s", exc)
     try:
-        fuse_flux2_double_stream_attention_projections(pipe.transformer)
-    except Exception:
-        pass
+        fused_blocks = fuse_flux2_double_stream_attention_projections(pipe.transformer)
+        if fused_blocks == 0:
+            logger.info("no flux2 double-stream projections were fused")
+    except Exception as exc:
+        logger.warning("double-stream projection fusion failed, continuing without it: %s", exc)
     return apply_attention_backend(pipe, backend)
 
 
