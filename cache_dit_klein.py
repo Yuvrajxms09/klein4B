@@ -269,24 +269,34 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         qkv = fused[..., : 3 * self.hidden_size]
         mlp = fused[..., 3 * self.hidden_size :]
         fused_qkv = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, qkv.shape[-1] // (3 * self.num_heads)).contiguous()
-        fused = _fused_qkv_rope_qk_norm(fused_qkv, self.norm, pe)
-        if fused is not None:
-            q, k, v = fused
-            q_for_attention = q
-            k_for_attention = k
-            v_for_attention = v
-        else:
-            q, k, v = _split_qkv_heads(qkv, self.num_heads)
-            q, k = _qk_norm(self.norm, q, k, v)
-            q, k = _apply_rope(q, k, pe)
-            q_for_attention = q
-            k_for_attention = k
-            v_for_attention = v
-        attn = _packed_attention_call(q_for_attention, k_for_attention, v_for_attention)
+        attn = None
+        if fused_qkv.shape[0] == 1:
+            try:
+                attn = ns.fused_qkv_attention_(
+                    fused_qkv.reshape(fused_qkv.shape[0] * fused_qkv.shape[1], self.num_heads, 3, fused_qkv.shape[-1]).contiguous(),
+                    self.norm.query_norm.scale.to(dtype=torch.float32, copy=False),
+                    self.norm.key_norm.scale.to(dtype=torch.float32, copy=False),
+                    pe[0, 0, :, :, 0, 0].contiguous(),
+                    pe[0, 0, :, :, 1, 0].contiguous(),
+                    0,
+                    fused_qkv.shape[0] * fused_qkv.shape[1],
+                    1.0 / (fused_qkv.shape[-1] ** 0.5),
+                )
+            except Exception:
+                attn = None
         if attn is None:
-            attn = _attention(q_for_attention, k_for_attention, v_for_attention)
-        if attn is None:
-            raise RuntimeError("attention path unexpectedly failed")
+            fused = _fused_qkv_rope_qk_norm(fused_qkv, self.norm, pe)
+            if fused is not None:
+                q, k, v = fused
+            else:
+                q, k, v = _split_qkv_heads(qkv, self.num_heads)
+                q, k = _qk_norm(self.norm, q, k, v)
+                q, k = _apply_rope(q, k, pe)
+            attn = _packed_attention_call(q, k, v)
+            if attn is None:
+                attn = _attention(q, k, v)
+            if attn is None:
+                raise RuntimeError("attention path unexpectedly failed")
         mlp_act = _silu_mul(mlp)
         fused = torch.cat((attn, mlp_act), dim=-1)
         output = self.linear2(fused)
