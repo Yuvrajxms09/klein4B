@@ -49,7 +49,22 @@ def benchmark() -> None:
     )
 
     ns = torch.ops.klein_cuda
-    print(f"joint_packed_attention_present={hasattr(ns, 'joint_packed_attention_')}")
+    caps = {
+        "silu_mul_": hasattr(ns, "silu_mul_"),
+        "adaln_norm": hasattr(ns, "adaln_norm"),
+        "qk_rms_norm_": hasattr(ns, "qk_rms_norm_"),
+        "rope_2d_offset_": hasattr(ns, "rope_2d_offset_"),
+        "packed_attention_": hasattr(ns, "packed_attention_"),
+        "fused_qkv_attention_": hasattr(ns, "fused_qkv_attention_"),
+        "joint_packed_attention_": hasattr(ns, "joint_packed_attention_"),
+    }
+    print("klein_cuda_capabilities:")
+    for name, enabled in caps.items():
+        print(f"  {name}={enabled}")
+    if not caps["joint_packed_attention_"]:
+        print("joint_packed_attention_status=rebuild_required")
+    else:
+        print("joint_packed_attention_status=ready")
 
     device = "cuda"
     torch.manual_seed(0)
@@ -213,7 +228,8 @@ def benchmark() -> None:
             )
         raise RuntimeError("joint_packed_attention_ is not registered")
 
-    print("joint_packed_attention_smoke_shape=", [tuple(t.shape) for t in ker_joint_attention()])
+    joint_out = ker_joint_attention()
+    print("joint_packed_attention_smoke_shape=", [tuple(t.shape) for t in joint_out])
 
     def max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
         return float((a - b).abs().max().item())
