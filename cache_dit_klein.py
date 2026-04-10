@@ -158,6 +158,13 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
     def _bhq_from_seq_major(x: torch.Tensor, batch: int, seq: int) -> torch.Tensor:
         return x.reshape(batch, seq, x.shape[1], x.shape[2]).contiguous()
 
+    def _flatten_attention_output(x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 3:
+            return x.reshape(x.shape[0], x.shape[1], -1).contiguous()
+        if x.ndim == 4:
+            return x.permute(0, 2, 1, 3).reshape(x.shape[0], x.shape[2], -1).contiguous()
+        raise ValueError(f"unexpected attention output rank: {x.ndim}")
+
     def _attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         if _has_op("packed_attention_") and q.is_cuda and k.is_cuda and v.is_cuda and q.dtype == torch.float32:
             return ns.packed_attention_(q, k, v, 1.0 / (q.shape[-1] ** 0.5))
@@ -272,7 +279,8 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         attn = None
         if fused_qkv.shape[0] == 1:
             try:
-                attn = ns.fused_qkv_attention_(
+                attn = _flatten_attention_output(
+                    ns.fused_qkv_attention_(
                     fused_qkv.reshape(fused_qkv.shape[0] * fused_qkv.shape[1], self.num_heads, 3, fused_qkv.shape[-1]).contiguous(),
                     self.norm.query_norm.scale.to(dtype=torch.float32, copy=False),
                     self.norm.key_norm.scale.to(dtype=torch.float32, copy=False),
@@ -281,6 +289,7 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                     0,
                     fused_qkv.shape[0] * fused_qkv.shape[1],
                     1.0 / (fused_qkv.shape[-1] ** 0.5),
+                    )
                 )
             except Exception:
                 attn = None
@@ -297,6 +306,7 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                 attn = _attention(q, k, v)
             if attn is None:
                 raise RuntimeError("attention path unexpectedly failed")
+            attn = _flatten_attention_output(attn)
         mlp_act = _silu_mul(mlp)
         fused = torch.cat((attn, mlp_act), dim=-1)
         output = self.linear2(fused)
@@ -384,9 +394,9 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         q = torch.cat((txt_q, img_q), dim=2)
         k = torch.cat((txt_k, img_k), dim=2)
         v = torch.cat((txt_v, img_v), dim=2)
-        attn = _attention(q, k, v)
-        txt_attn = attn[:, :, : txt_q.shape[2]]
-        img_attn = attn[:, :, txt_q.shape[2] :]
+        attn = _flatten_attention_output(_attention(q, k, v))
+        txt_attn = attn[:, : txt_q.shape[2]]
+        img_attn = attn[:, txt_q.shape[2] :]
 
         img = img + img_mod1_gate * self.img_attn.proj(img_attn)
         img = img + img_mod2_gate * self.img_mlp(self.img_norm2(img).mul_(1 + img_mod2_scale).add_(img_mod2_shift))
@@ -446,6 +456,8 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                             v_context,
                             1.0 / (q_hidden.shape[-1] ** 0.5),
                         )
+                        attn_hidden = _flatten_attention_output(attn_hidden)
+                        attn_context = _flatten_attention_output(attn_context)
                     except Exception:
                         logger.info("double_stream_joint_packed_attention fallback_to_per_stream")
                         attn_hidden = None
@@ -455,9 +467,9 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                     hidden_attn = _packed_attention_call(q_hidden, k_hidden, v_hidden)
                     context_attn = _packed_attention_call(q_context, k_context, v_context)
                     if attn_hidden is None and hidden_attn is not None:
-                        attn_hidden = hidden_attn
+                        attn_hidden = _flatten_attention_output(hidden_attn)
                     if attn_context is None and context_attn is not None:
-                        attn_context = context_attn
+                        attn_context = _flatten_attention_output(context_attn)
                 if attn_hidden is None or attn_context is None:
                     logger.info("double_stream_generic_joint_attention_fallback")
                     q = torch.cat((q_context, q_hidden), dim=2)
@@ -466,9 +478,9 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                     if image_rotary_emb is not None:
                         pe = image_rotary_emb[0]
                         q, k = _apply_rope(q, k, pe)
-                    attn = _attention(q, k, v)
-                    attn_context = attn[:, :, : q_context.shape[2]]
-                    attn_hidden = attn[:, :, q_context.shape[2] :]
+                    attn = _flatten_attention_output(_attention(q, k, v))
+                    attn_context = attn[:, : q_context.shape[2]]
+                    attn_hidden = attn[:, q_context.shape[2] :]
             except Exception:
                 attn_hidden = None
                 attn_context = None
@@ -483,7 +495,7 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
             )
 
         hidden_states = hidden_states + gate_msa * attn_hidden
-        norm_hidden_states = _adaln(img_norm2, hidden_states, shift_mlp, scale_mlp)
+        norm_hidden_states = _adaln(self.norm2, hidden_states, shift_mlp, scale_mlp)
         ff_output = self.ff(norm_hidden_states)
         hidden_states = hidden_states + gate_mlp * ff_output
 
