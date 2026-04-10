@@ -3,10 +3,14 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <vector>
+#include <limits>
 
 namespace {
+constexpr float LOG2E = 1.4426950408889634074f;
 constexpr int BLOCK_NORM = 256;
 constexpr int BLOCK_1D = 256;
+constexpr int ATTN_THREADS = 128;
+constexpr int ATTN_TILE = 32;
 }
 
 __global__ void k_silu_mul(float* gate, const float* up, int n) {
@@ -140,15 +144,17 @@ __global__ void k_rope_2d_offset(
 }
 
 torch::Tensor silu_mul_cuda_(torch::Tensor gate, torch::Tensor up) {
-    auto gate_c = gate.contiguous();
-    auto up_c = up.contiguous();
+    auto gate_c = gate.is_contiguous() ? gate : gate.contiguous();
+    auto up_c = up.is_contiguous() ? up : up.contiguous();
     int n = static_cast<int>(gate_c.numel());
     int grid = (n + BLOCK_1D - 1) / BLOCK_1D;
     k_silu_mul<<<grid, BLOCK_1D, 0, at::cuda::getDefaultCUDAStream()>>>(
         gate_c.data_ptr<float>(),
         up_c.data_ptr<float>(),
         n);
-    gate.copy_(gate_c);
+    if (!gate.is_contiguous()) {
+        gate.copy_(gate_c);
+    }
     return gate;
 }
 
@@ -172,10 +178,10 @@ torch::Tensor adaln_norm_cuda(torch::Tensor x, torch::Tensor shift, torch::Tenso
 }
 
 std::vector<torch::Tensor> qk_rms_norm_cuda_(torch::Tensor q, torch::Tensor k, torch::Tensor qw, torch::Tensor kw, double eps) {
-    auto q_c = q.contiguous();
-    auto k_c = k.contiguous();
-    auto qw_c = qw.contiguous();
-    auto kw_c = kw.contiguous();
+    auto q_c = q.is_contiguous() ? q : q.contiguous();
+    auto k_c = k.is_contiguous() ? k : k.contiguous();
+    auto qw_c = qw.is_contiguous() ? qw : qw.contiguous();
+    auto kw_c = kw.is_contiguous() ? kw : kw.contiguous();
     int seq = static_cast<int>(q_c.size(0));
     int heads = static_cast<int>(q_c.size(1));
     int hdim = static_cast<int>(q_c.size(2));
@@ -190,15 +196,19 @@ std::vector<torch::Tensor> qk_rms_norm_cuda_(torch::Tensor q, torch::Tensor k, t
         heads,
         hdim,
         static_cast<float>(eps));
-    q.copy_(q_c);
-    k.copy_(k_c);
+    if (!q.is_contiguous()) {
+        q.copy_(q_c);
+    }
+    if (!k.is_contiguous()) {
+        k.copy_(k_c);
+    }
     return {q, k};
 }
 
 torch::Tensor rope_2d_offset_cuda_(torch::Tensor x, torch::Tensor cos, torch::Tensor sin, int64_t seq_offset, int64_t seq_len) {
-    auto x_c = x.contiguous();
-    auto cos_c = cos.contiguous();
-    auto sin_c = sin.contiguous();
+    auto x_c = x.is_contiguous() ? x : x.contiguous();
+    auto cos_c = cos.is_contiguous() ? cos : cos.contiguous();
+    auto sin_c = sin.is_contiguous() ? sin : sin.contiguous();
 
     int seq = static_cast<int>(seq_len);
     int heads = static_cast<int>(x_c.size(1));
@@ -214,6 +224,163 @@ torch::Tensor rope_2d_offset_cuda_(torch::Tensor x, torch::Tensor cos, torch::Te
         static_cast<int>(seq_offset),
         heads,
         hdim);
-    x.copy_(x_c);
+    if (!x.is_contiguous()) {
+        x.copy_(x_c);
+    }
     return x;
+}
+
+__global__ void k_packed_attention(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* out,
+    int seq,
+    int heads,
+    int hdim,
+    float scale) {
+    int idx = blockIdx.x;
+    int s = idx / heads;
+    int h = idx % heads;
+    if (s >= seq) return;
+
+    const float* qh = q + (s * heads + h) * hdim;
+    const float* kh = k + (s * heads + h) * hdim;
+    const float* vh = v + (s * heads + h) * hdim;
+    float* oh = out + (s * heads + h) * hdim;
+
+    __shared__ float partials[ATTN_THREADS];
+    __shared__ float score;
+    __shared__ float weight;
+    __shared__ float rescale;
+    __shared__ float prev_rowmax;
+    __shared__ float rowmax;
+    __shared__ float rowsum;
+
+    if (threadIdx.x == 0) {
+        rowmax = -std::numeric_limits<float>::infinity();
+        rowsum = 0.0f;
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    const bool active = threadIdx.x < hdim;
+    const int d = threadIdx.x;
+    float vreg = active ? vh[d] : 0.0f;
+
+    const float scaled = scale * LOG2E;
+    for (int key = 0; key < seq; ++key) {
+        float partial = 0.0f;
+        for (int d = threadIdx.x; d < hdim; d += blockDim.x) {
+            partial += qh[d] * kh[key * hdim + d];
+        }
+        partials[threadIdx.x] = partial;
+        __syncthreads();
+
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                partials[threadIdx.x] += partials[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) {
+            prev_rowmax = rowmax;
+            score = partials[0] * scaled;
+            if (score > rowmax) {
+                rescale = __exp2f(rowmax - score);
+                weight = 1.0f;
+                rowsum = rowsum * rescale + 1.0f;
+                rowmax = score;
+            } else {
+                rescale = 1.0f;
+                weight = __exp2f(score - rowmax);
+                rowsum += weight;
+            }
+        }
+        __syncthreads();
+
+        if (active) {
+            if (key == 0) {
+                acc = vreg;
+            } else if (score > prev_rowmax) {
+                acc = acc * rescale + vreg;
+            } else {
+                acc += weight * vreg;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+        oh[d] = acc / rowsum;
+    }
+}
+
+std::vector<torch::Tensor> fused_qkv_rope_qk_norm_cuda_(
+    torch::Tensor qkv,
+    torch::Tensor qw,
+    torch::Tensor kw,
+    torch::Tensor cos,
+    torch::Tensor sin,
+    int64_t seq_offset,
+    int64_t seq_len) {
+    auto qkv_c = qkv.is_contiguous() ? qkv : qkv.contiguous();
+    auto q = qkv_c.select(2, 0);
+    auto k = qkv_c.select(2, 1);
+    auto v = qkv_c.select(2, 2);
+
+    qk_rms_norm_cuda_(q, k, qw, kw, 1e-6);
+    rope_2d_offset_cuda_(q, cos, sin, seq_offset, seq_len);
+    rope_2d_offset_cuda_(k, cos, sin, seq_offset, seq_len);
+    return {q, k, v};
+}
+
+torch::Tensor packed_attention_cuda_(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale) {
+    auto q_c = q.is_contiguous() ? q : q.contiguous();
+    auto k_c = k.is_contiguous() ? k : k.contiguous();
+    auto v_c = v.is_contiguous() ? v : v.contiguous();
+    TORCH_CHECK(q_c.scalar_type() == torch::kFloat32, "q must be float32");
+    TORCH_CHECK(k_c.scalar_type() == torch::kFloat32, "k must be float32");
+    TORCH_CHECK(v_c.scalar_type() == torch::kFloat32, "v must be float32");
+    TORCH_CHECK(q_c.dim() == 3, "q must be [seq, heads, head_dim]");
+    TORCH_CHECK(k_c.sizes() == q_c.sizes() && v_c.sizes() == q_c.sizes(), "q/k/v shapes must match");
+
+    auto out = torch::zeros_like(q_c);
+    int seq = static_cast<int>(q_c.size(0));
+    int heads = static_cast<int>(q_c.size(1));
+    int hdim = static_cast<int>(q_c.size(2));
+    int grid = seq * heads;
+
+    k_packed_attention<<<grid, ATTN_THREADS, 0, at::cuda::getDefaultCUDAStream()>>>(
+        q_c.data_ptr<float>(),
+        k_c.data_ptr<float>(),
+        v_c.data_ptr<float>(),
+        out.data_ptr<float>(),
+        seq,
+        heads,
+        hdim,
+        static_cast<float>(scale));
+    return out;
+}
+
+torch::Tensor fused_qkv_attention_cuda_(
+    torch::Tensor qkv,
+    torch::Tensor qw,
+    torch::Tensor kw,
+    torch::Tensor cos,
+    torch::Tensor sin,
+    int64_t seq_offset,
+    int64_t seq_len,
+    double scale) {
+    auto qkv_c = qkv.is_contiguous() ? qkv : qkv.contiguous();
+    TORCH_CHECK(qkv_c.scalar_type() == torch::kFloat32, "qkv must be float32");
+    TORCH_CHECK(qkv_c.dim() == 4 && qkv_c.size(2) == 3, "qkv must be [seq, heads, 3, head_dim]");
+    auto q = qkv_c.select(2, 0);
+    auto k = qkv_c.select(2, 1);
+    auto v = qkv_c.select(2, 2);
+    qk_rms_norm_cuda_(q, k, qw, kw, 1e-6);
+    rope_2d_offset_cuda_(q, cos, sin, seq_offset, seq_len);
+    rope_2d_offset_cuda_(k, cos, sin, seq_offset, seq_len);
+    return packed_attention_cuda_(q, k, v, scale);
 }
