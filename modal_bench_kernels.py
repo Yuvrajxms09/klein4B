@@ -35,6 +35,7 @@ def benchmark() -> None:
     cuda_dir = repo / "cuda_kernels"
     os.chdir(cuda_dir)
     os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
+    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
 
     from torch.utils.cpp_extension import load
 
@@ -48,6 +49,7 @@ def benchmark() -> None:
     )
 
     ns = torch.ops.klein_cuda
+    print(f"joint_packed_attention_present={hasattr(ns, 'joint_packed_attention_')}")
 
     device = "cuda"
     torch.manual_seed(0)
@@ -190,6 +192,34 @@ def benchmark() -> None:
         ns.silu_mul_(gate4, up3)
         return y + attn.transpose(0, 1).reshape(seq, hidden) + gate4 + proj
 
+    # Double-stream joint attention smoke check.
+    q_hidden = torch.randn(128, heads, head_dim, device=device, dtype=torch.float32)
+    k_hidden = torch.randn_like(q_hidden)
+    v_hidden = torch.randn_like(q_hidden)
+    q_context = torch.randn(64, heads, head_dim, device=device, dtype=torch.float32)
+    k_context = torch.randn_like(q_context)
+    v_context = torch.randn_like(q_context)
+
+    def ker_joint_attention():
+        if hasattr(ns, "joint_packed_attention_"):
+            return ns.joint_packed_attention_(
+                q_hidden,
+                k_hidden,
+                v_hidden,
+                q_context,
+                k_context,
+                v_context,
+                1.0 / (head_dim ** 0.5),
+            )
+        raise RuntimeError("joint_packed_attention_ is not registered")
+
+    print("joint_packed_attention_smoke_shape=", [tuple(t.shape) for t in ker_joint_attention()])
+
+    def max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
+        return float((a - b).abs().max().item())
+
+    print("fused_proxy_diff=", max_abs_diff(ref_fused_proxy(), ker_fused_proxy()))
+
     # Realistic double-block proxy.
     img_seq = 864
     txt_seq = 512
@@ -278,8 +308,12 @@ def benchmark() -> None:
         txt_q = (txt_norm @ txt_q_w).view(txt_seq, heads, head_dim)
         txt_k = (txt_norm @ txt_k_w).view(txt_seq, heads, head_dim)
         txt_v_local = (txt_norm @ txt_v_w).view(txt_seq, heads, head_dim)
-        ns.qk_rms_norm_(img_q.clone(), img_k.clone(), img_qw, img_kw, 1e-6)
-        ns.qk_rms_norm_(txt_q.clone(), txt_k.clone(), txt_qw, txt_kw, 1e-6)
+        img_q = img_q.clone()
+        img_k = img_k.clone()
+        txt_q = txt_q.clone()
+        txt_k = txt_k.clone()
+        ns.qk_rms_norm_(img_q, img_k, img_qw, img_kw, 1e-6)
+        ns.qk_rms_norm_(txt_q, txt_k, txt_qw, txt_kw, 1e-6)
         ns.rope_2d_offset_(img_q, img_cos, img_sin, 0, img_seq)
         ns.rope_2d_offset_(img_k, img_cos, img_sin, 0, img_seq)
         ns.rope_2d_offset_(txt_q, txt_cos, txt_sin, 0, txt_seq)
@@ -290,8 +324,67 @@ def benchmark() -> None:
         txt_attn = torch.nn.functional.scaled_dot_product_attention(txt_q.transpose(0, 1), kv.transpose(0, 1), vv.transpose(0, 1), is_causal=False).transpose(0, 1)
         img_proj = img_attn.reshape(img_seq, hidden) @ img_proj_w
         txt_proj = txt_attn.reshape(txt_seq, hidden) @ txt_proj_w
-        ns.silu_mul_(gate3.clone(), up3)
-        return img_proj.mean() + txt_proj.mean()
+        img_out = img_hidden + img_proj * img_gate1
+        txt_out = txt_hidden + txt_proj * txt_gate1
+        return img_out + txt_out.mean()
+
+    print("block_style_diff=", max_abs_diff(ref_block_style(), ker_block_style()))
+
+    # Lower-materialization proxy for the deeper live-path cleanup:
+    # keep the attention stream shapes closer to the model path and avoid
+    # unnecessary clones/transposes in the kernel side.
+    def ref_deep_fused_proxy():
+        img_norm = (img_hidden - img_hidden.mean(dim=-1, keepdim=True))
+        img_norm = img_norm * torch.rsqrt(img_norm.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        img_norm = (1.0 + img_scale1) * img_norm + img_shift1
+        txt_norm = (txt_hidden - txt_hidden.mean(dim=-1, keepdim=True))
+        txt_norm = txt_norm * torch.rsqrt(txt_norm.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        txt_norm = (1.0 + txt_scale1) * txt_norm + txt_shift1
+
+        img_q = (img_norm @ img_q_w).view(img_seq, heads, head_dim)
+        img_k = (img_norm @ img_k_w).view(img_seq, heads, head_dim)
+        img_v_local = (img_norm @ img_v_w).view(img_seq, heads, head_dim)
+        txt_q = (txt_norm @ txt_q_w).view(txt_seq, heads, head_dim)
+        txt_k = (txt_norm @ txt_k_w).view(txt_seq, heads, head_dim)
+        txt_v_local = (txt_norm @ txt_v_w).view(txt_seq, heads, head_dim)
+
+        q = torch.cat((txt_q, img_q), dim=0).transpose(0, 1)
+        k = torch.cat((txt_k, img_k), dim=0).transpose(0, 1)
+        v = torch.cat((txt_v_local, img_v_local), dim=0).transpose(0, 1)
+        attn = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False).transpose(0, 1)
+
+        img_attn = attn[txt_seq:]
+        txt_attn = attn[:txt_seq]
+        img_proj = img_attn.reshape(img_seq, hidden) @ img_proj_w
+        txt_proj = txt_attn.reshape(txt_seq, hidden) @ txt_proj_w
+        gate = torch.nn.functional.silu(gate3)
+        mlp = gate * up3
+        return img_proj.mean() + txt_proj.mean() + mlp.mean()
+
+    def ker_deep_fused_proxy():
+        img_norm = ns.adaln_norm(img_hidden, img_shift1, img_scale1, 1e-6)
+        txt_norm = ns.adaln_norm(txt_hidden, txt_shift1, txt_scale1, 1e-6)
+        img_q = (img_norm @ img_q_w).view(img_seq, heads, head_dim)
+        img_k = (img_norm @ img_k_w).view(img_seq, heads, head_dim)
+        img_v_local = (img_norm @ img_v_w).view(img_seq, heads, head_dim)
+        txt_q = (txt_norm @ txt_q_w).view(txt_seq, heads, head_dim)
+        txt_k = (txt_norm @ txt_k_w).view(txt_seq, heads, head_dim)
+        txt_v_local = (txt_norm @ txt_v_w).view(txt_seq, heads, head_dim)
+
+        q = torch.cat((txt_q, img_q), dim=0).transpose(0, 1)
+        k = torch.cat((txt_k, img_k), dim=0).transpose(0, 1)
+        v = torch.cat((txt_v_local, img_v_local), dim=0).transpose(0, 1)
+        attn = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False).transpose(0, 1)
+
+        img_attn = attn[txt_seq:]
+        txt_attn = attn[:txt_seq]
+        img_proj = img_attn.reshape(img_seq, hidden) @ img_proj_w
+        txt_proj = txt_attn.reshape(txt_seq, hidden) @ txt_proj_w
+        gate = gate3.clone()
+        ns.silu_mul_(gate, up3)
+        return img_proj.mean() + txt_proj.mean() + gate.mean()
+
+    print("deep_fused_diff=", abs(ref_deep_fused_proxy().item() - ker_deep_fused_proxy().item()))
 
     # Exact shape/layout proxy for the Flux2 hooks we wired into model.py.
     hook_batch = 1
@@ -342,6 +435,8 @@ def benchmark() -> None:
         ns.silu_mul_(gate, up_hook)
         return q3.mean() + k3.mean() + gate.mean()
 
+    print("model_hook_diff=", abs(ref_model_hook().item() - ker_model_hook().item()))
+
     # GPU residency / reuse: keep tensors on device across repeated calls.
     persistent_gate = torch.randn(16384, 1024, device=device, dtype=torch.float32)
     persistent_up = torch.randn_like(persistent_gate)
@@ -356,6 +451,28 @@ def benchmark() -> None:
         ns.silu_mul_(y, persistent_up)
         return y
 
+    print("resident_diff=", abs(ref_resident().mean().item() - ker_resident().mean().item()))
+
+    # Attention backend sweep on a representative model-shaped tensor layout.
+    attn_q = torch.randn(1, 24, 864, 128, device=device, dtype=torch.bfloat16)
+    attn_k = torch.randn_like(attn_q)
+    attn_v = torch.randn_like(attn_q)
+
+    def ref_attn_default():
+        return torch.nn.functional.scaled_dot_product_attention(attn_q, attn_k, attn_v)
+
+    def ref_attn_flash_ctx():
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=False, enable_math=False):
+            return torch.nn.functional.scaled_dot_product_attention(attn_q, attn_k, attn_v)
+
+    def ref_attn_mem_ctx():
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=True, enable_math=False):
+            return torch.nn.functional.scaled_dot_product_attention(attn_q, attn_k, attn_v)
+
+    def ref_attn_math_ctx():
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+            return torch.nn.functional.scaled_dot_product_attention(attn_q, attn_k, attn_v)
+
     results = {
         "silu_ref_ms": bench(ref_silu),
         "silu_ker_ms": bench(ker_silu),
@@ -369,10 +486,16 @@ def benchmark() -> None:
         "fused_proxy_ker_ms": bench(ker_fused_proxy),
         "block_style_ref_ms": bench(ref_block_style),
         "block_style_ker_ms": bench(ker_block_style),
+        "deep_fused_ref_ms": bench(ref_deep_fused_proxy),
+        "deep_fused_ker_ms": bench(ker_deep_fused_proxy),
         "model_hook_ref_ms": bench(ref_model_hook),
         "model_hook_ker_ms": bench(ker_model_hook),
         "resident_ref_ms": bench(ref_resident),
         "resident_ker_ms": bench(ker_resident),
+        "attn_default_ms": bench(ref_attn_default),
+        "attn_flash_ctx_ms": bench(ref_attn_flash_ctx),
+        "attn_mem_ctx_ms": bench(ref_attn_mem_ctx),
+        "attn_math_ctx_ms": bench(ref_attn_math_ctx),
     }
 
     for k, v in results.items():
@@ -384,6 +507,10 @@ def benchmark() -> None:
     print(
         "resident_speedup=%.3fx"
         % (results["resident_ref_ms"] / max(results["resident_ker_ms"], 1e-9))
+    )
+    print(
+        "deep_fused_speedup=%.3fx"
+        % (results["deep_fused_ref_ms"] / max(results["deep_fused_ker_ms"], 1e-9))
     )
 
 
