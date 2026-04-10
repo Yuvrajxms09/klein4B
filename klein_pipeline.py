@@ -804,6 +804,57 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 return_dict=False,
             )[0]
 
+    def _prepare_denoiser_inputs(
+        self,
+        latents: torch.Tensor,
+        image_latents: torch.Tensor | None,
+        latent_ids: torch.Tensor,
+        image_latent_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build denoiser inputs with a reusable fused buffer when reference-image latents are present.
+
+        This avoids repeated cat/to churn inside the denoising loop while keeping the tensor layout
+        identical to the eager path.
+        """
+        if image_latents is None or image_latent_ids is None:
+            return latents, latent_ids
+
+        total_seq = latents.shape[1] + image_latents.shape[1]
+        batch = latents.shape[0]
+        channels = latents.shape[-1]
+        dtype = self.transformer.dtype
+        device = latents.device
+
+        latent_model_input = getattr(self, "_denoiser_input_buffer", None)
+        buffer_shape = (batch, total_seq, channels)
+        if (
+            latent_model_input is None
+            or latent_model_input.shape != buffer_shape
+            or latent_model_input.device != device
+            or latent_model_input.dtype != dtype
+        ):
+            latent_model_input = torch.empty(buffer_shape, device=device, dtype=dtype)
+            self._denoiser_input_buffer = latent_model_input
+
+        latent_model_input[:, : latents.shape[1]].copy_(latents)
+        latent_model_input[:, latents.shape[1] :].copy_(image_latents)
+
+        latent_image_ids = getattr(self, "_denoiser_image_ids_buffer", None)
+        id_shape = (batch, total_seq, latent_ids.shape[-1])
+        if (
+            latent_image_ids is None
+            or latent_image_ids.shape != id_shape
+            or latent_image_ids.device != latent_ids.device
+            or latent_image_ids.dtype != latent_ids.dtype
+        ):
+            latent_image_ids = torch.empty(id_shape, device=latent_ids.device, dtype=latent_ids.dtype)
+            self._denoiser_image_ids_buffer = latent_image_ids
+
+        latent_image_ids[:, : latent_ids.shape[1]].copy_(latent_ids)
+        latent_image_ids[:, latent_ids.shape[1] :].copy_(image_latent_ids)
+        return latent_model_input, latent_image_ids
+
     def _run_full_backend_img2img(
         self,
         *,
@@ -1191,6 +1242,11 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 verbose=False,
             )
 
+        if latents.dtype != self.transformer.dtype:
+            latents = latents.to(self.transformer.dtype)
+        if image_latents is not None and image_latents.dtype != self.transformer.dtype:
+            image_latents = image_latents.to(self.transformer.dtype)
+
         # 7. Denoising loop
         # We set the index here to remove DtoH sync, helpful especially during compilation.
         # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
@@ -1205,12 +1261,12 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-                latent_model_input = latents.to(self.transformer.dtype)
-                latent_image_ids = latent_ids
-
-                if image_latents is not None:
-                    latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
-                    latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
+                latent_model_input, latent_image_ids = self._prepare_denoiser_inputs(
+                    latents=latents,
+                    image_latents=image_latents,
+                    latent_ids=latent_ids,
+                    image_latent_ids=image_latent_ids,
+                )
 
                 if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                     torch.compiler.cudagraph_mark_step_begin()

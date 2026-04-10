@@ -15,6 +15,8 @@ from __future__ import annotations
 import torch
 from typing import Any
 from types import MethodType
+from pathlib import Path
+from typing import Optional
 
 try:
     from einops import rearrange
@@ -57,7 +59,27 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
 
     ns = getattr(torch.ops, "klein_cuda", None)
     if ns is None:
+        try:
+            from cuda_kernels import load_compiled_extension
+
+            load_compiled_extension()
+            ns = getattr(torch.ops, "klein_cuda", None)
+        except Exception as exc:
+            raise RuntimeError("torch.ops.klein_cuda is unavailable; load the extension first") from exc
+    if ns is None:
         raise RuntimeError("torch.ops.klein_cuda is unavailable; load the extension first")
+
+    def _has_op(name: str) -> bool:
+        return hasattr(ns, name)
+
+    # Prefer flash/mem-efficient SDPA globally so the hot path doesn't need a
+    # per-call context manager. This keeps the live block wrapper lighter.
+    try:
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(False)
+    except Exception:
+        pass
 
     def _split_qkv_heads(qkv: torch.Tensor, num_heads: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         b, l, _ = qkv.shape
@@ -66,13 +88,15 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         qkv = qkv.permute(2, 0, 3, 1, 4).contiguous()
         return qkv[0], qkv[1], qkv[2]
 
-    def _split_modulation(mod: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def _split_modulation(
+        mod: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         parts = mod.chunk(6, dim=-1)
         first = parts[:3]
         second = parts[3:]
         if first[0].ndim == 2:
-            first = tuple(t[:, None, :] for t in first)
-            second = tuple(t[:, None, :] for t in second)
+            first = tuple(t.unsqueeze(1) for t in first)
+            second = tuple(t.unsqueeze(1) for t in second)
         return first, second
 
     def _apply_rope(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -100,11 +124,38 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
         return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
 
-    def _attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pe: torch.Tensor) -> torch.Tensor:
-        q, k = _apply_rope(q, k, pe)
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
-            x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        return rearrange(x, "B H L D -> B L (H D)")
+    def _packed_attention_call(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
+        if not _has_op("packed_attention_"):
+            return None
+        if not (q.is_cuda and k.is_cuda and v.is_cuda):
+            return None
+        if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
+            return None
+        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+            return None
+        if q.shape != k.shape or q.shape != v.shape:
+            return None
+        if q.shape[-1] > 128:
+            return None
+        return ns.packed_attention_(q, k, v, 1.0 / (q.shape[-1] ** 0.5))
+
+    def _seq_major_from_batched_qkv(qkv: torch.Tensor) -> torch.Tensor:
+        if qkv.ndim != 5 or qkv.shape[2] != 3:
+            raise ValueError(f"expected [batch, seq, 3, heads, head_dim], got {tuple(qkv.shape)}")
+        return qkv.reshape(qkv.shape[0] * qkv.shape[1], qkv.shape[3], 3, qkv.shape[4]).contiguous()
+
+    def _seq_major_from_bhq(x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"expected [batch, heads, seq, head_dim], got {tuple(x.shape)}")
+        return x.permute(0, 2, 1, 3).reshape(x.shape[0] * x.shape[2], x.shape[1], x.shape[3]).contiguous()
+
+    def _bhq_from_seq_major(x: torch.Tensor, batch: int, seq: int) -> torch.Tensor:
+        return x.reshape(batch, seq, x.shape[1], x.shape[2]).contiguous()
+
+    def _attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        if _has_op("packed_attention_") and q.is_cuda and k.is_cuda and v.is_cuda and q.dtype == torch.float32:
+            return ns.packed_attention_(q, k, v, 1.0 / (q.shape[-1] ** 0.5))
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
     def _qk_norm(module: Any, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if (
@@ -117,13 +168,68 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         ):
             qn = q.permute(0, 2, 1, 3).reshape(-1, q.shape[1], q.shape[3]).contiguous()
             kn = k.permute(0, 2, 1, 3).reshape(-1, k.shape[1], k.shape[3]).contiguous()
-            qw = module.query_norm.scale.float().contiguous()
-            kw = module.key_norm.scale.float().contiguous()
+            qw = module.query_norm.scale.to(dtype=torch.float32, copy=False)
+            kw = module.key_norm.scale.to(dtype=torch.float32, copy=False)
             qn = ns.qk_rms_norm_(qn, kn, qw, kw)
             q = qn.reshape(q.shape[0], q.shape[2], q.shape[1], q.shape[3]).permute(0, 2, 1, 3).to(v)
             k = kn.reshape(k.shape[0], k.shape[2], k.shape[1], k.shape[3]).permute(0, 2, 1, 3).to(v)
             return q, k
         return module.query_norm(q).to(v), module.key_norm(k).to(v)
+
+    def _fused_qkv_rope_qk_norm(
+        qkv: torch.Tensor,
+        module: Any,
+        pe: torch.Tensor,
+        seq_offset: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if not hasattr(ns, "fused_qkv_rope_qk_norm_"):
+            return None
+        if not (qkv.is_cuda and qkv.dtype == torch.float32 and qkv.ndim == 4 and qkv.shape[2] == 3):
+            return None
+        try:
+            qw = module.query_norm.scale.to(dtype=torch.float32, copy=False)
+            kw = module.key_norm.scale.to(dtype=torch.float32, copy=False)
+            b, l, _, h, d = qkv.shape
+            qkv3 = qkv.reshape(b * l, h, 3, d).contiguous()
+            q, k, v = ns.fused_qkv_rope_qk_norm_(
+                qkv3,
+                qw,
+                kw,
+                pe[0, 0, :, :, 0, 0].contiguous(),
+                pe[0, 0, :, :, 1, 0].contiguous(),
+                seq_offset,
+                qkv3.shape[0],
+            )
+            return q, k, v
+        except Exception:
+            return None
+
+    def _fused_qkv_attention(
+        qkv: torch.Tensor,
+        module: Any,
+        pe: torch.Tensor,
+        seq_offset: int = 0,
+    ) -> torch.Tensor | None:
+        if not hasattr(ns, "fused_qkv_attention_"):
+            return None
+        if not (qkv.is_cuda and qkv.dtype == torch.float32 and qkv.ndim == 5 and qkv.shape[2] == 3):
+            return None
+        try:
+            qw = module.query_norm.scale.to(dtype=torch.float32, copy=False)
+            kw = module.key_norm.scale.to(dtype=torch.float32, copy=False)
+            qkv3 = _seq_major_from_batched_qkv(qkv)
+            return ns.fused_qkv_attention_(
+                qkv3,
+                qw,
+                kw,
+                pe[0, 0, :, :, 0, 0].contiguous(),
+                pe[0, 0, :, :, 1, 0].contiguous(),
+                seq_offset,
+                qkv3.shape[0],
+                1.0 / (qkv3.shape[-1] ** 0.5),
+            )
+        except Exception:
+            return None
 
     def _silu_mul(x: torch.Tensor) -> torch.Tensor:
         x1, x2 = x.chunk(2, dim=-1)
@@ -131,17 +237,50 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
             return ns.silu_mul_(x1, x2)
         return torch.nn.functional.silu(x1) * x2
 
+    def _adaln(module: Any, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        if (
+            _has_op("adaln_norm")
+            and x.is_cuda
+            and x.dtype == torch.float32
+            and shift.is_cuda
+            and scale.is_cuda
+            and shift.dtype == torch.float32
+            and scale.dtype == torch.float32
+            and shift.ndim == 1
+            and scale.ndim == 1
+            and x.shape[-1] == shift.shape[0]
+            and x.shape[-1] == scale.shape[0]
+        ):
+            return ns.adaln_norm(x, shift, scale, 1e-6)
+        return module(x).mul_(1 + scale).add_(shift)
+
     def _single_forward(self, x: torch.Tensor, pe: torch.Tensor, mod: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         mod_shift, mod_scale, mod_gate = mod
-        x_mod = self.pre_norm(x)
-        x_mod = x_mod.mul_(1 + mod_scale).add_(mod_shift)
+        x_mod = _adaln(self.pre_norm, x, mod_shift, mod_scale)
         fused = self.linear1(x_mod)
         qkv = fused[..., : 3 * self.hidden_size]
         mlp = fused[..., 3 * self.hidden_size :]
-        q, k, v = _split_qkv_heads(qkv, self.num_heads)
-        q, k = _qk_norm(self.norm, q, k, v)
-        attn = _attention(q, k, v, pe)
-        output = self.linear2(torch.cat((attn, _silu_mul(mlp)), dim=-1))
+        fused_qkv = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, qkv.shape[-1] // (3 * self.num_heads)).contiguous()
+        fused = _fused_qkv_rope_qk_norm(fused_qkv, self.norm, pe)
+        if fused is not None:
+            q, k, v = fused
+        else:
+            q, k, v = _split_qkv_heads(qkv, self.num_heads)
+            q, k = _qk_norm(self.norm, q, k, v)
+            q, k = _apply_rope(q, k, pe)
+            q = _seq_major_from_bhq(q)
+            k = _seq_major_from_bhq(k)
+            v = _seq_major_from_bhq(v)
+        attn = _packed_attention_call(q, k, v)
+        if attn is None:
+            attn = _attention(q, k, v)
+        if attn is None:
+            raise RuntimeError("attention path unexpectedly failed")
+        if attn.ndim == 3:
+            attn = _bhq_from_seq_major(attn, x.shape[0], x.shape[1]).reshape(x.shape[0], x.shape[1], -1)
+        mlp_act = _silu_mul(mlp)
+        fused = torch.cat((attn, mlp_act), dim=-1)
+        output = self.linear2(fused)
         return x + mod_gate * output
 
     def _single_forward_diffusers(
@@ -155,6 +294,8 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         text_seq_len: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         joint_attention_kwargs = joint_attention_kwargs or {}
+        attn = self.attn
+        norm = self.norm
         if verbose:
             print("[klein] single block", type(self).__name__, "hidden", tuple(hidden_states.shape))
         if encoder_hidden_states is not None:
@@ -162,12 +303,11 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
             hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
         mod_shift, mod_scale, mod_gate = temb_mod.chunk(3, dim=-1)
         if mod_shift.ndim == 2:
-            mod_shift = mod_shift[:, None, :]
-            mod_scale = mod_scale[:, None, :]
-            mod_gate = mod_gate[:, None, :]
-        norm_hidden_states = self.norm(hidden_states)
-        norm_hidden_states = (1 + mod_scale) * norm_hidden_states + mod_shift
-        attn_output = self.attn(
+            mod_shift = mod_shift.unsqueeze(1)
+            mod_scale = mod_scale.unsqueeze(1)
+            mod_gate = mod_gate.unsqueeze(1)
+        norm_hidden_states = _adaln(norm, hidden_states, mod_shift, mod_scale)
+        attn_output = attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
@@ -198,20 +338,40 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
 
         img_modulated = self.img_norm1(img)
         img_modulated = img_modulated.mul_(1 + img_mod1_scale).add_(img_mod1_shift)
-        img_q, img_k, img_v = _split_qkv_heads(self.img_attn.qkv(img_modulated), self.num_heads)
-        img_q, img_k = _qk_norm(self.img_attn.norm, img_q, img_k, img_v)
+        img_qkv = self.img_attn.qkv(img_modulated).view(img_modulated.shape[0], img_modulated.shape[1], 3, self.num_heads, self.img_attn.qkv.out_features // (3 * self.num_heads)).contiguous()
+        fused_img = _fused_qkv_rope_qk_norm(img_qkv, self.img_attn.norm, pe)
+        if fused_img is None:
+            img_q, img_k, img_v = _split_qkv_heads(self.img_attn.qkv(img_modulated), self.num_heads)
+            img_q, img_k = _qk_norm(self.img_attn.norm, img_q, img_k, img_v)
+            img_q, img_k = _apply_rope(img_q, img_k, pe)
+            img_q = _seq_major_from_bhq(img_q)
+            img_k = _seq_major_from_bhq(img_k)
+            img_v = _seq_major_from_bhq(img_v)
+        else:
+            img_q, img_k, img_v = fused_img
 
         txt_modulated = self.txt_norm1(txt)
         txt_modulated = txt_modulated.mul_(1 + txt_mod1_scale).add_(txt_mod1_shift)
-        txt_q, txt_k, txt_v = _split_qkv_heads(self.txt_attn.qkv(txt_modulated), self.num_heads)
-        txt_q, txt_k = _qk_norm(self.txt_attn.norm, txt_q, txt_k, txt_v)
+        txt_qkv = self.txt_attn.qkv(txt_modulated).view(txt_modulated.shape[0], txt_modulated.shape[1], 3, self.num_heads, self.txt_attn.qkv.out_features // (3 * self.num_heads)).contiguous()
+        fused_txt = _fused_qkv_rope_qk_norm(txt_qkv, self.txt_attn.norm, pe_ctx)
+        if fused_txt is None:
+            txt_q, txt_k, txt_v = _split_qkv_heads(self.txt_attn.qkv(txt_modulated), self.num_heads)
+            txt_q, txt_k = _qk_norm(self.txt_attn.norm, txt_q, txt_k, txt_v)
+            txt_q, txt_k = _apply_rope(txt_q, txt_k, pe_ctx)
+            txt_q = _seq_major_from_bhq(txt_q)
+            txt_k = _seq_major_from_bhq(txt_k)
+            txt_v = _seq_major_from_bhq(txt_v)
+        else:
+            txt_q, txt_k, txt_v = fused_txt
 
-        q = torch.cat((txt_q, img_q), dim=2)
-        k = torch.cat((txt_k, img_k), dim=2)
-        v = torch.cat((txt_v, img_v), dim=2)
-        pe = torch.cat((pe_ctx, pe), dim=2)
-        attn = _attention(q, k, v, pe)
-        txt_attn, img_attn = attn[:, : txt_q.shape[2]], attn[:, txt_q.shape[2] :]
+        q = torch.cat((txt_q, img_q), dim=0)
+        k = torch.cat((txt_k, img_k), dim=0)
+        v = torch.cat((txt_v, img_v), dim=0)
+        attn = _attention(q, k, v)
+        txt_attn = attn[: txt_q.shape[0]]
+        img_attn = attn[txt_q.shape[0] :]
+        txt_attn = _bhq_from_seq_major(txt_attn, txt_modulated.shape[0], txt_modulated.shape[1])
+        img_attn = _bhq_from_seq_major(img_attn, img_modulated.shape[0], img_modulated.shape[1])
 
         img = img + img_mod1_gate * self.img_attn.proj(img_attn)
         img = img + img_mod2_gate * self.img_mlp(self.img_norm2(img).mul_(1 + img_mod2_scale).add_(img_mod2_shift))
@@ -229,33 +389,71 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         joint_attention_kwargs = joint_attention_kwargs or {}
+        img_attn = self.img_attn
+        txt_attn = self.txt_attn
+        img_norm1 = self.img_norm1
+        txt_norm1 = self.txt_norm1
+        img_norm2 = self.img_norm2
+        txt_norm2 = self.txt_norm2
+        img_mlp = self.img_mlp
+        txt_mlp = self.txt_mlp
         if verbose:
             print("[klein] double block", type(self).__name__, "img", tuple(hidden_states.shape), "txt", tuple(encoder_hidden_states.shape))
         (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = _split_modulation(temb_mod_img)
         (c_shift_msa, c_scale_msa, c_gate_msa), (c_shift_mlp, c_scale_mlp, c_gate_mlp) = _split_modulation(temb_mod_txt)
 
-        norm_hidden_states = self.norm1(hidden_states)
-        norm_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
+        norm_hidden_states = _adaln(img_norm1, hidden_states, shift_msa, scale_msa)
         norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
-        norm_encoder_hidden_states = (1 + c_scale_msa) * norm_encoder_hidden_states + c_shift_msa
+        norm_encoder_hidden_states = _adaln(self.norm1_context, encoder_hidden_states, c_shift_msa, c_scale_msa)
 
-        # Use the existing attention module, but keep the block math and projections in-place.
-        attn_hidden, attn_context = self.attn(
-            hidden_states=norm_hidden_states,
-            encoder_hidden_states=norm_encoder_hidden_states,
-            image_rotary_emb=image_rotary_emb,
-            **joint_attention_kwargs,
-        )
+        # Use packed attention when the Flux block exposes qkv modules; otherwise fall back.
+        attn_hidden = None
+        attn_context = None
+        if hasattr(self, "qkv") and hasattr(self, "qkv_context") and hasattr(self, "proj"):
+            try:
+                qkv_hidden = self.qkv(norm_hidden_states)
+                qkv_context = self.qkv_context(norm_encoder_hidden_states)
+                q_hidden, k_hidden, v_hidden = _split_qkv_heads(qkv_hidden, self.num_heads)
+                q_context, k_context, v_context = _split_qkv_heads(qkv_context, self.num_heads)
+                q_hidden, k_hidden = _qk_norm(self.img_attn.norm, q_hidden, k_hidden, v_hidden)
+                q_context, k_context = _qk_norm(self.txt_attn.norm, q_context, k_context, v_context)
+                q = torch.cat((_seq_major_from_bhq(q_context), _seq_major_from_bhq(q_hidden)), dim=0)
+                k = torch.cat((_seq_major_from_bhq(k_context), _seq_major_from_bhq(k_hidden)), dim=0)
+                v = torch.cat((_seq_major_from_bhq(v_context), _seq_major_from_bhq(v_hidden)), dim=0)
+                if image_rotary_emb is not None:
+                    pe = image_rotary_emb[0]
+                    q, k = _apply_rope(q, k, pe)
+                attn = _packed_attention_call(q, k, v)
+                if attn is None:
+                    attn = _attention(q, k, v)
+                attn_context = attn[: q_context.shape[0]]
+                attn_hidden = attn[q_context.shape[0] :]
+                attn_context = _bhq_from_seq_major(
+                    attn_context, encoder_hidden_states.shape[0], encoder_hidden_states.shape[1]
+                ).reshape(encoder_hidden_states.shape[0], encoder_hidden_states.shape[1], -1)
+                attn_hidden = _bhq_from_seq_major(attn_hidden, hidden_states.shape[0], hidden_states.shape[1]).reshape(
+                    hidden_states.shape[0], hidden_states.shape[1], -1
+                )
+            except Exception:
+                attn_hidden = None
+                attn_context = None
+
+        if attn_hidden is None or attn_context is None:
+            # Use the existing attention module, but keep the block math and projections in-place.
+            attn_hidden, attn_context = self.attn(
+                hidden_states=norm_hidden_states,
+                encoder_hidden_states=norm_encoder_hidden_states,
+                image_rotary_emb=image_rotary_emb,
+                **joint_attention_kwargs,
+            )
 
         hidden_states = hidden_states + gate_msa * attn_hidden
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+        norm_hidden_states = _adaln(img_norm2, hidden_states, shift_mlp, scale_mlp)
         ff_output = self.ff(norm_hidden_states)
         hidden_states = hidden_states + gate_mlp * ff_output
 
         encoder_hidden_states = encoder_hidden_states + c_gate_msa * attn_context
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp) + c_shift_mlp
+        norm_encoder_hidden_states = _adaln(self.norm2_context, encoder_hidden_states, c_shift_mlp, c_scale_mlp)
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
         encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
         if encoder_hidden_states.dtype == torch.float16:
@@ -336,6 +534,150 @@ def enable_klein_c_full_backend(
     )
     pipe._klein_c_full_backend = backend
     return backend
+
+
+class NunchakuKleinFullBackend:
+    """
+    Nunchaku-style end-to-end img2img backend for Klein4B.
+
+    This keeps the denoising loop outside Diffusers' transformer call path and uses
+    the Nunchaku Flux2 transformer implementation directly.
+    """
+
+    def __init__(self, *, model_dir: str, pipe: Any | None = None):
+        self.model_dir = str(model_dir)
+        self.pipe = pipe
+        self._model = None
+
+    def _load_model(self):
+        if self._model is not None:
+            return self._model
+        try:
+            from nunchaku.models.transformers import NunchakuFlux2Transformer2DModel
+        except Exception as exc:
+            raise RuntimeError("nunchaku Flux2 transformer is not importable") from exc
+
+        model_path = Path(self.model_dir)
+        if not model_path.exists():
+            raise FileNotFoundError(f"model_dir does not exist: {self.model_dir}")
+        self._model = NunchakuFlux2Transformer2DModel.from_pretrained(
+            model_path,
+            device="cuda",
+            torch_dtype=torch.float16,
+            offload=False,
+        )
+        return self._model
+
+    def _prepare_latents(self, image: torch.Tensor, generator: Optional[torch.Generator], dtype: torch.dtype):
+        if self.pipe is None:
+            raise RuntimeError("pipe is required for latent preprocessing")
+        return self.pipe.prepare_latents(
+            batch_size=1,
+            num_latents_channels=self.pipe.transformer.config.in_channels // 4,
+            height=image.shape[-2],
+            width=image.shape[-1],
+            dtype=dtype,
+            device=self.pipe._execution_device,
+            generator=generator,
+            latents=None,
+        )
+
+    def img2img(self, prompt: str, image: PIL.Image.Image, config: Any):
+        if self.pipe is None:
+            raise RuntimeError("NunchakuKleinFullBackend requires an attached pipe")
+        model = self._load_model()
+        pipe = self.pipe
+
+        device = pipe._execution_device
+        prompt_embeds, text_ids = pipe.encode_prompt(
+            prompt=prompt,
+            device=device,
+            num_images_per_prompt=1,
+            max_sequence_length=getattr(config, "max_sequence_length", 512),
+            text_encoder_out_layers=getattr(config, "text_encoder_out_layers", (9, 18, 27)),
+        )
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        image = pipe.image_processor.preprocess(image, height=config.height, width=config.width, resize_mode="crop")
+        image_latents, image_latent_ids = pipe.prepare_image_latents(
+            images=[image],
+            batch_size=1,
+            generator=None if config.seed < 0 else torch.Generator(device=device).manual_seed(int(config.seed)),
+            device=device,
+            dtype=pipe.vae.dtype,
+            non_blocking_h2d=True,
+        )
+        latents, latent_ids = pipe.prepare_latents(
+            batch_size=1,
+            num_latents_channels=pipe.transformer.config.in_channels // 4,
+            height=config.height,
+            width=config.width,
+            dtype=prompt_embeds.dtype,
+            device=device,
+            generator=None if config.seed < 0 else torch.Generator(device=device).manual_seed(int(config.seed)),
+            latents=None,
+        )
+        latents = latents.to(model.dtype)
+        image_latents = image_latents.to(model.dtype)
+        latent_ids = latent_ids.to(device)
+        image_latent_ids = image_latent_ids.to(device)
+        timesteps, _ = pipe._get_timesteps_cached(latents.shape[1], int(config.num_steps), device)
+        guidance = torch.tensor([float(config.guidance)], device=device, dtype=latents.dtype)
+        for t in timesteps:
+            timestep = t.expand(latents.shape[0]).to(latents.dtype)
+            latent_model_input = torch.cat([latents, image_latents], dim=1).to(model.dtype)
+            latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
+            noise_pred = model(
+                hidden_states=latent_model_input,
+                encoder_hidden_states=prompt_embeds,
+                timestep=timestep,
+                img_ids=latent_image_ids,
+                txt_ids=text_ids,
+                guidance=guidance,
+                joint_attention_kwargs=None,
+                return_dict=False,
+            )[0]
+            noise_pred = noise_pred[:, : latents.size(1)]
+            latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        latents = pipe._unpack_latents_with_ids(latents, latent_ids)
+        latents_bn_mean = pipe.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+        latents_bn_std = torch.sqrt(pipe.vae.bn.running_var.view(1, -1, 1, 1) + pipe.vae.config.batch_norm_eps).to(
+            latents.device, latents.dtype
+        )
+        latents = latents * latents_bn_std + latents_bn_mean
+        latents = pipe._unpatchify_latents(latents)
+        image = pipe.vae.decode(latents, return_dict=False)[0]
+        image = pipe.image_processor.postprocess(image, output_type="pil")[0]
+        return image
+
+
+def enable_nunchaku_full_backend(pipe: Any, *, model_dir: str) -> Any:
+    backend = NunchakuKleinFullBackend(model_dir=model_dir, pipe=pipe)
+    pipe._klein_c_full_backend = backend
+    return backend
+
+
+def enable_nunchaku_transformer(pipe: Any, *, model_dir: str) -> Any:
+    """
+    Replace the Diffusers transformer with a Nunchaku Flux2 transformer.
+
+    This is the closest match to the nunchaku runtime style: the pipeline keeps
+    its scheduler/VAE/prompt code, but the denoiser module itself becomes the
+    Nunchaku implementation.
+    """
+    try:
+        from nunchaku.models.transformers import NunchakuFlux2Transformer2DModel
+    except Exception as exc:
+        raise RuntimeError("nunchaku Flux2 transformer is not importable") from exc
+
+    model = NunchakuFlux2Transformer2DModel.from_pretrained(
+        model_dir,
+        device="cuda",
+        torch_dtype=torch.float16,
+        offload=False,
+    )
+    pipe.transformer = model
+    return model
 
 
 def _parse_steps_mask(mask_text: str, expected_steps: int) -> list[int]:
@@ -474,6 +816,96 @@ ATTENTION_BACKEND_ALIASES = {
 }
 # Order tried when backend="auto": prefer flash3, then sage, then native.
 AUTO_ATTENTION_BACKEND_CANDIDATES = ("_flash_3", "sage", "native")
+
+
+def prepare_transformer_for_speed(
+    pipe: Any,
+    *,
+    backend: str = "sage",
+    fuse_qkv: bool = True,
+    patch_klein_ops: bool = True,
+) -> str | None:
+    """
+    Apply the stable hot-path configuration once, before cache-dit / compile.
+
+    This keeps the attention processor identity stable while still enabling the
+    best available fused QKV path and backend for the current model.
+    """
+    if patch_klein_ops:
+        try:
+            from cuda_kernels import is_loaded, load_compiled_extension
+
+            if not is_loaded():
+                load_compiled_extension()
+            apply_flux2_transformer_klein_ops(pipe.transformer, verbose=False)
+        except Exception:
+            pass
+    if fuse_qkv and hasattr(pipe.transformer, "fuse_qkv_projections"):
+        try:
+            pipe.transformer.fuse_qkv_projections()
+            setattr(pipe.transformer, "_is_qkv_fused", True)
+        except Exception:
+            pass
+    try:
+        fuse_flux2_double_stream_attention_projections(pipe.transformer)
+    except Exception:
+        pass
+    return apply_attention_backend(pipe, backend)
+
+
+def _make_fused_linear_from_linears(linears: list[torch.nn.Linear]) -> torch.nn.Linear:
+    if not linears:
+        raise ValueError("expected at least one linear module")
+    first = linears[0]
+    if any(l.in_features != first.in_features for l in linears):
+        raise ValueError("all fused linears must share input features")
+    if any(l.bias is not None for l in linears) and any(l.bias is None for l in linears):
+        raise ValueError("all fused linears must either all have bias or all omit bias")
+    fused = torch.nn.Linear(
+        first.in_features,
+        sum(l.out_features for l in linears),
+        bias=first.bias is not None,
+        device=first.weight.device,
+        dtype=first.weight.dtype,
+    )
+    with torch.no_grad():
+        fused.weight.copy_(torch.cat([l.weight.detach() for l in linears], dim=0))
+        if fused.bias is not None:
+            fused.bias.copy_(torch.cat([l.bias.detach() for l in linears], dim=0))
+    return fused
+
+
+def fuse_flux2_double_stream_attention_projections(transformer: Any) -> int:
+    """
+    Replace the double-stream Flux2Attention projection stacks with fused qkv / added-qkv
+    modules when the block shape matches Diffusers Flux2Attention.
+
+    This keeps the model semantics unchanged but collapses 6 GEMMs into 2 GEMMs per
+    double-stream attention block, which is the biggest remaining linear overhead in the
+    current checkpoint.
+    """
+    fused_blocks = 0
+    for module in transformer.modules():
+        if module.__class__.__name__ != "Flux2Attention":
+            continue
+        if not all(hasattr(module, name) for name in ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj")):
+            continue
+        if getattr(module, "fused_projections", False):
+            continue
+        try:
+            module.to_qkv = _make_fused_linear_from_linears([module.to_q, module.to_k, module.to_v])
+            module.to_added_qkv = _make_fused_linear_from_linears(
+                [module.add_q_proj, module.add_k_proj, module.add_v_proj]
+            )
+            module.fused_projections = True
+            # Keep the original modules attached for state_dict compatibility but stop
+            # the hot path from touching them through the fused projection branch.
+            fused_blocks += 1
+        except Exception:
+            continue
+    if fused_blocks:
+        print(f"flux2_double_stream_attention_fused_blocks={fused_blocks}")
+    return fused_blocks
 
 
 def apply_attention_backend(pipe: Any, backend: str = "sage") -> str | None:
