@@ -42,6 +42,7 @@ image = (
     .pip_install("cache-dit")
     .pip_install("ninja", "setuptools", "wheel")
     .run_commands("pip install -U torchao")
+    .run_commands("pip install -U mslk-cuda")
     .add_local_dir(_repo_root(), remote_path="/root/klein4B")
     .add_local_dir(str(Path(_repo_root()).parent / "diffusers"), remote_path="/root/diffusers")
     .add_local_dir(str(Path(_repo_root()).parent / "flux2"), remote_path="/root/flux2")
@@ -188,7 +189,7 @@ def _load_nvfp4_transformer(*, model_dir: str, dtype, local_files_only: bool = T
 
     quantization_config = TorchAoConfig(
         NVFP4DynamicActivationNVFP4WeightConfig(
-            use_triton_kernel=False,
+            use_triton_kernel=True,
             use_dynamic_per_tensor_scale=True,
         ),
     )
