@@ -1153,18 +1153,18 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         if output_type == "latent":
             image = latents
         else:
+            decoded_image = None
             if self._vae_decode_fn is not None:
                 try:
-                    image = self._vae_decode_fn(latents)
+                    decoded_image = self._vae_decode_fn(latents)
                 except Exception:
                     logger.warning("vae decoder compiled path failed, fallback to eager")
                     self._vae_decode_fn = None
-                    image = self.vae.decode(latents, return_dict=False)[0]
+                    decoded_image = self.vae.decode(latents, return_dict=False)[0]
             else:
-                image = self.vae.decode(latents, return_dict=False)[0]
-            image = self.image_processor.postprocess(image, output_type=output_type)
-            if output_type == "pil":
-                self._prev_output = self._pil_to_thwc_tensor(image[0]).detach().clone()
+                decoded_image = self.vae.decode(latents, return_dict=False)[0]
+            self._prev_output = ((decoded_image.clamp(-1, 1) + 1) / 2)[0].permute(1, 2, 0).unsqueeze(0).float().cpu()
+            image = self.image_processor.postprocess(decoded_image, output_type=output_type)
 
         # Offload all models
         self.maybe_free_model_hooks()
