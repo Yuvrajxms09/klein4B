@@ -223,6 +223,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._vae_encode_fn: Callable | None = None
         self._vae_decode_fn: Callable | None = None
 
+        # Optional temporal feedback state for iterative refinement loops.
+        self._prev_output: torch.Tensor | None = None
+
     @staticmethod
     def _get_qwen3_prompt_embeds(
         text_encoder: Qwen3ForCausalLM,
@@ -639,11 +642,29 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             out = out.pin_memory()
         return out
 
+    @staticmethod
+    def _thwc_tensor_to_pil(tensor: torch.Tensor) -> PIL.Image.Image:
+        """Convert a THWC tensor in [0, 1] range to a PIL image."""
+        arr = (tensor.squeeze(0).clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+        return PIL.Image.fromarray(arr, mode="RGB")
+
+    @staticmethod
+    def _pil_to_thwc_tensor(image: PIL.Image.Image) -> torch.Tensor:
+        """Convert a PIL image to a THWC tensor in [0, 1] range."""
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        arr = np.array(image, dtype=np.float32) / 255.0
+        return torch.from_numpy(arr).unsqueeze(0)
+
     def clear_inference_caches(self) -> None:
         """Clear timesteps, image latent IDs, and prompt caches."""
         self._timesteps_cache.clear()
         self._image_latent_ids_cache.clear()
         self._prompt_cache.clear()
+
+    def clear_temporal_state(self) -> None:
+        """Clear the cached previous output used by the temporal refinement loop."""
+        self._prev_output = None
 
     def enable_compile(
         self,
@@ -790,6 +811,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         num_inference_steps: int = 4,
         sigmas: list[float] | None = None,
         guidance_scale: float = 4.0,
+        feedback_strength: float = 0.5,
         num_images_per_prompt: int = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.Tensor | None = None,
@@ -823,6 +845,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 `guidance_scale > 1`. Higher guidance scale encourages to generate images that are closely linked to
                 the text `prompt`, usually at the expense of lower image quality. For step-wise distilled models,
                 `guidance_scale` is ignored.
+            feedback_strength (`float`, *optional*, defaults to 0.5):
+                When no input image is provided and a previous output exists, reuse that output as the starting point
+                for partial denoising. Set to 0 to disable the temporal feedback loop.
             height (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
                 The height in pixels of the generated image. This is set to 1024 by default for the best results.
             width (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
@@ -892,6 +917,43 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._attention_kwargs = attention_kwargs
         self._current_timestep = None
         self._interrupt = False
+
+        if image is None:
+            if isinstance(prompt, list) and len(prompt) > 0:
+                prompt_text = prompt[0] if isinstance(prompt[0], str) else str(prompt[0])
+            else:
+                prompt_text = prompt if isinstance(prompt, str) else ""
+
+            if not prompt_text.strip():
+                print("[FLUX-KLEIN] BRANCH: no prompt, returning cached/black", flush=True)
+                height = height or self.default_sample_size * self.vae_scale_factor
+                width = width or self.default_sample_size * self.vae_scale_factor
+                if self._prev_output is not None:
+                    if return_dict:
+                        return Flux2PipelineOutput(images=self._thwc_tensor_to_pil(self._prev_output) if output_type == "pil" else self._prev_output.numpy())
+                    return (self._prev_output,)
+                black = torch.zeros(1, height, width, 3)
+                if return_dict:
+                    return Flux2PipelineOutput(images=self._thwc_tensor_to_pil(black) if output_type == "pil" else black.numpy())
+                return (black,)
+
+            if self._prev_output is not None and feedback_strength > 0:
+                print(f"[FLUX-KLEIN] BRANCH: refine_frame (strength={feedback_strength})", flush=True)
+                base_generator = generator[0] if isinstance(generator, list) and len(generator) > 0 else generator
+                return self.refine_frame(
+                    prompt=prompt_text,
+                    previous_image=self._prev_output,
+                    height=height or self.default_sample_size * self.vae_scale_factor,
+                    width=width or self.default_sample_size * self.vae_scale_factor,
+                    guidance_scale=guidance_scale,
+                    num_inference_steps=num_inference_steps,
+                    generator=base_generator if isinstance(base_generator, torch.Generator) else None,
+                    output_type=output_type,
+                    strength=feedback_strength,
+                    max_sequence_length=max_sequence_length,
+                    text_encoder_out_layers=text_encoder_out_layers,
+                    return_dict=return_dict,
+                )
 
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
@@ -1101,6 +1163,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             else:
                 image = self.vae.decode(latents, return_dict=False)[0]
             image = self.image_processor.postprocess(image, output_type=output_type)
+            if output_type == "pil":
+                self._prev_output = self._pil_to_thwc_tensor(image[0]).detach().clone()
 
         # Offload all models
         self.maybe_free_model_hooks()
@@ -1108,4 +1172,140 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         if not return_dict:
             return (image,)
 
+        return Flux2PipelineOutput(images=image)
+
+    @torch.no_grad()
+    def refine_frame(
+        self,
+        prompt: str,
+        previous_image: PIL.Image.Image | torch.Tensor,
+        height: int,
+        width: int,
+        guidance_scale: float = 4.0,
+        num_inference_steps: int = 4,
+        generator: torch.Generator | None = None,
+        output_type: str = "pil",
+        strength: float = 0.5,
+        max_sequence_length: int = 512,
+        text_encoder_out_layers: tuple[int] = (9, 18, 27),
+        return_dict: bool = True,
+    ):
+        """Refine a previous frame by partial denoising instead of regenerating from scratch."""
+        if strength <= 0:
+            if isinstance(previous_image, torch.Tensor):
+                if previous_image.ndim != 4:
+                    raise ValueError(f"Expected previous_image to be 4D, got {previous_image.ndim}D")
+                image = previous_image
+                if image.min() >= -1 and image.max() <= 1:
+                    image = (image.clamp(-1, 1) + 1) / 2
+                elif image.max() > 1:
+                    image = image / 255.0
+                result = image.float().cpu()
+            else:
+                result = self._pil_to_thwc_tensor(previous_image).float().cpu()
+            self._prev_output = result.detach().clone()
+            if output_type == "pil":
+                image = self._thwc_tensor_to_pil(result)
+            else:
+                image = result.numpy()
+            if not return_dict:
+                return (image,)
+            return Flux2PipelineOutput(images=image)
+
+        device = self._execution_device
+        if generator is None:
+            generator = torch.Generator(device="cpu")
+
+        prompt_embeds, text_ids = self.encode_prompt(
+            prompt=prompt,
+            device=device,
+            num_images_per_prompt=1,
+            max_sequence_length=max_sequence_length,
+            text_encoder_out_layers=text_encoder_out_layers,
+        )
+
+        if isinstance(previous_image, torch.Tensor):
+            image_tensor = previous_image.to(device=device, dtype=self.vae.dtype)
+            if image_tensor.ndim != 4:
+                raise ValueError(f"Expected previous_image to be 4D, got {image_tensor.ndim}D")
+            if image_tensor.min() >= 0 and image_tensor.max() <= 1:
+                image_tensor = image_tensor.mul(2.0).sub(1.0)
+            elif image_tensor.max() > 1:
+                image_tensor = image_tensor.div(255.0).mul(2.0).sub(1.0)
+        else:
+            previous_image = previous_image.resize((width, height), PIL.Image.LANCZOS)
+            image_tensor = self.image_processor.preprocess(previous_image, height=height, width=width)
+            image_tensor = image_tensor.to(device=device, dtype=self.vae.dtype)
+
+        image_latents = self._encode_vae_image(image_tensor, generator=generator)
+        latent_ids = self._prepare_latent_ids(image_latents).to(device)
+        clean_latents = self._pack_latents(image_latents)
+
+        image_seq_len = clean_latents.shape[1]
+        timesteps, _ = self._get_timesteps_cached(image_seq_len, num_inference_steps, device)
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+        t_start = max(num_inference_steps - init_timestep, 0)
+        timesteps = timesteps[t_start:]
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(t_start)
+        self.scheduler._step_index = None
+
+        if len(timesteps) == 0:
+            result = (image_tensor.clamp(-1, 1) + 1) / 2
+            result = result[0].permute(1, 2, 0).unsqueeze(0).float().cpu()
+            self._prev_output = result.detach().clone()
+            if output_type == "pil":
+                image = self._thwc_tensor_to_pil(result)
+            else:
+                image = result.numpy()
+            if not return_dict:
+                return (image,)
+            return Flux2PipelineOutput(images=image)
+
+        start_sigma = (timesteps[0].float() / self.scheduler.config.num_train_timesteps).view(-1, 1, 1)
+        start_sigma = start_sigma.to(device=device, dtype=self.transformer.dtype)
+        noise = randn_tensor(clean_latents.shape, generator=generator, device=device, dtype=self.transformer.dtype)
+        latents = start_sigma * noise + (1.0 - start_sigma) * clean_latents.to(self.transformer.dtype)
+
+        for t in timesteps:
+            timestep = t.expand(latents.shape[0]).to(latents.dtype)
+            noise_pred = self.transformer(
+                hidden_states=latents.to(self.transformer.dtype),
+                timestep=timestep / 1000,
+                guidance=None,
+                encoder_hidden_states=prompt_embeds,
+                txt_ids=text_ids,
+                img_ids=latent_ids,
+                joint_attention_kwargs=self._attention_kwargs,
+                return_dict=False,
+            )[0]
+            noise_pred = noise_pred[:, :image_seq_len]
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+        latents = self._unpack_latents_with_ids(latents, latent_ids)
+        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+        latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
+            latents.device, latents.dtype
+        )
+        latents = latents * latents_bn_std + latents_bn_mean
+        latents = self._unpatchify_latents(latents)
+
+        if self._vae_decode_fn is not None:
+            try:
+                image = self._vae_decode_fn(latents)
+            except Exception:
+                logger.warning("vae decoder compiled path failed, fallback to eager")
+                self._vae_decode_fn = None
+                image = self.vae.decode(latents, return_dict=False)[0]
+        else:
+            image = self.vae.decode(latents, return_dict=False)[0]
+
+        image = self.image_processor.postprocess(image, output_type=output_type)
+        if output_type == "pil":
+            result = self._pil_to_thwc_tensor(image[0]).float().cpu()
+        else:
+            result = torch.from_numpy(np.asarray(image[0])).float().div(255.0).unsqueeze(0).cpu()
+        self._prev_output = result.detach().clone()
+        if not return_dict:
+            return (image,)
         return Flux2PipelineOutput(images=image)
