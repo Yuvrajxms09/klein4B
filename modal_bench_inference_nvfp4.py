@@ -1,17 +1,64 @@
 """
-## use this branch and repo  for klein4B - 
-!git clone -b cuda-kernels --single-branch https://github.com/Yuvrajxms09/klein4B.git
+changes from last colab notebook:
+1. using lighter vae (taef2)
+2. nvfp4 weight + activation quantization at runtime
+3. inductor flags for torch compile
+4. different compile settings
 
-## for diffusers use this branch - https://github.com/Yuvrajxms09/diffusers/tree/version2-flux2-speedups
+## install dependencies 
+
+## Reference dependency snapshot (Modal run, 2026-04-12)- works perfectly
+- torch==2.11.0+cu130, torchao==0.17.0, Pillow==12.2.0, CUDA (PyTorch)==13.0
+
+(might break because of diffusers or torch ao attribute error)
+for all correct deps, please refer to modal image below but don't forget to install these 2 deps below:
+- `pip install -U torchao` (NVFP4 needs `torchao.prototype.mx_formats`).
+- `pip install -U mslk-cuda`
+
+## setup — clone the required repos
+
+1. klein4B with the older optimizations
+- `git clone -b cuda-kernels --single-branch https://github.com/Yuvrajxms09/klein4B.git`
+2. Diffusers with some optimizations to speed up ops
+- `git clone -b version2-flux2-speedups --single-branch https://github.com/Yuvrajxms09/diffusers.git`
+
+## NVFP4 weights + dynamic activations — `_load_nvfp4_transformer` (lines 156–182))
+
+- Imports (inside `_load_nvfp4_transformer`): 
+`import torch`; 
+`from diffusers import Flux2Transformer2DModel, TorchAoConfig`;
+`from torchao.prototype.mx_formats import NVFP4DynamicActivationNVFP4WeightConfig`.
+
+- Recreate `TorchAoConfig(NVFP4DynamicActivationNVFP4WeightConfig(use_triton_kernel=True, use_dynamic_per_tensor_scale=True))`
+  and pass it to `Flux2Transformer2DModel.from_pretrained(..., subfolder="transformer", quantization_config=..., torch_dtype=dtype,
+  local_files_only=...)`.
+
+## CUDA matmul / TF32  (lines 242–251)
+- Apply `torch.set_grad_enabled(False)` and the `try` blocks that set `torch.set_float32_matmul_precision("high")`,
+  `torch.backends.cuda.matmul.allow_tf32`, and `torch.backends.cudnn.allow_tf32`.
 
 
-Deps — reference resolved versions from one Modal run (2026-04-12); image deps below
-are mostly unpinned
-    torch==2.11.0+cu130
-    torchao==0.17.0
-    Pillow==12.2.0
-    CUDA (PyTorch)==13.0
-    cuDNN==9.1.9 (build 91900)
+## Klein4B imports needed (lines 264–266)
+
+- `from cache_dit_klein import prepare_transformer_for_speed, enable_cache_dit`
+- `from klein_pipeline import Flux2KleinPipeline`
+- `from taef2_vae import replace_pipeline_vae_with_taef2`
+
+## Klein + DiT speed hooks + VAE layout(lines 294–306)
+
+- TAEF2 branch: `replace_pipeline_vae_with_taef2(pipe, cache_dir=...)`; optional `pipe.vae.taesd.decoder.to(memory_format=torch.channels_last)`.
+- Always run `pipe.vae.to(memory_format=torch.channels_last)` after the branch.
+- Then `enable_cache_dit(pipe)` and `prepare_transformer_for_speed(pipe, backend="auto", fuse_qkv=True)`.
+
+## torch.compile — Inductor flags - set them before using torch compile (lines 308–311)
+
+## torch.compile — transformer + VAE IO — `benchmark()` (lines 313–338)
+
+- Assign `torch.compile(..., mode="max-autotune", fullgraph=False, dynamic=False)` to `pipe.transformer`, `pipe._vae_encode_fn`,
+  and `pipe._vae_decode_fn`.
+- Set all three `dynamic` values to `True` when height/width  changes between calls; keep `False` for fixed resolution
+  (slightly faster- some ms for static shapes).
+
 """
 
 from __future__ import annotations
