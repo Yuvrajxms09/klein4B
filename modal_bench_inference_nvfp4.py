@@ -3,7 +3,8 @@ changes from last colab notebook:
 1. using lighter vae (taef2)
 2. nvfp4 weight + activation quantization at runtime
 3. inductor flags for torch compile
-4. different compile settings
+4. different compile settings(using max-autotune this time)
+5. some changes in transformer and ops in diffusers repo for a bit of speedup
 
 ## install dependencies 
 
@@ -17,9 +18,10 @@ for all correct deps, please refer to modal image below but don't forget to inst
 
 ## setup — clone the required repos
 
-1. klein4B with the older optimizations
+1. klein4B with some new optimizations and fixed lighter vae (pls clone cuda-kernel branch)
 - `git clone -b cuda-kernels --single-branch https://github.com/Yuvrajxms09/klein4B.git`
-2. Diffusers with some optimizations to speed up ops
+
+2. Diffusers with some optimizations to speed up ops (clone version2-flux2-speedups branch)
 - `git clone -b version2-flux2-speedups --single-branch https://github.com/Yuvrajxms09/diffusers.git`
 
 ## NVFP4 weights + dynamic activations — `_load_nvfp4_transformer` (lines 156–182))
@@ -34,9 +36,10 @@ for all correct deps, please refer to modal image below but don't forget to inst
   local_files_only=...)`.
 
 ## CUDA matmul / TF32  (lines 242–251)
-- Apply `torch.set_grad_enabled(False)` and the `try` blocks that set `torch.set_float32_matmul_precision("high")`,
-  `torch.backends.cuda.matmul.allow_tf32`, and `torch.backends.cudnn.allow_tf32`.
 
+- torch.backends.cuda.matmul.allow_tf32 = True
+- torch.backends.cudnn.allow_tf32 = True
+- torch.set_float32_matmul_precision("high")
 
 ## Klein4B imports needed (lines 264–266)
 
@@ -51,6 +54,10 @@ for all correct deps, please refer to modal image below but don't forget to inst
 - Then `enable_cache_dit(pipe)` and `prepare_transformer_for_speed(pipe, backend="auto", fuse_qkv=True)`.
 
 ## torch.compile — Inductor flags - set them before using torch compile (lines 308–311)
+    torch._inductor.config.conv_1x1_as_mm = True
+    torch._inductor.config.coordinate_descent_tuning = True
+    torch._inductor.config.coordinate_descent_check_all_directions = True
+    torch._inductor.config.epilogue_fusion = False
 
 ## torch.compile — transformer + VAE IO — `benchmark()` (lines 313–338)
 
