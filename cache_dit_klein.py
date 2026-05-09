@@ -137,16 +137,45 @@ class SpatialCache:
 
     def preprocess_mask(self, input_mask: torch.Tensor) -> torch.Tensor:
         state = self._get_state()
+        if input_mask.ndim != 2:
+            raise ValueError(f"input_mask must be rank 2, got shape {tuple(input_mask.shape)}")
+
+        if input_mask.shape[1] == self.full_seq_len:
+            normalized_mask = input_mask
+        elif input_mask.shape[1] == self.text_seq_len + 2 * self.image_seq_len:
+            text_mask = input_mask[:, : self.text_seq_len]
+            image_mask_a = input_mask[:, self.text_seq_len : self.text_seq_len + self.image_seq_len]
+            image_mask_b = input_mask[
+                :, self.text_seq_len + self.image_seq_len : self.text_seq_len + 2 * self.image_seq_len
+            ]
+            normalized_mask = torch.cat(
+                [text_mask, torch.maximum(image_mask_a, image_mask_b)],
+                dim=-1,
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "spatial cache normalized mask layout step_key=%s input_len=%s output_len=%s",
+                    self.step_key,
+                    input_mask.shape[1],
+                    normalized_mask.shape[1],
+                )
+        else:
+            raise ValueError(
+                "unexpected mask length: got "
+                f"{input_mask.shape[1]}, expected {self.full_seq_len} or "
+                f"{self.text_seq_len + 2 * self.image_seq_len}"
+            )
+
         processed = torch.where(
             state["valid"] == 0,
             torch.tensor(2, device=self.device, dtype=torch.int32),
-            input_mask,
+            normalized_mask,
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "spatial cache preprocess mask step_key=%s counts_in=%s counts_out=%s valid=%s",
                 self.step_key,
-                self._mask_counts(input_mask),
+                self._mask_counts(normalized_mask),
                 self._mask_counts(processed),
                 int(state["valid"].sum().item()),
             )
