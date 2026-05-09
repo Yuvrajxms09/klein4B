@@ -19,6 +19,13 @@ We tried a lighter VAE (TAEF2) for faster encode/decode; it reduced output quali
 - **Custom CUDA denoiser hook** – Register a compiled `torch.ops` backend to replace transformer forward only:
   - `enable_cuda_denoiser_op(pipe, "klein_cuda.denoise_step", expected_hidden_tokens=..., enforce_cfg1=True)`
   - `latent_token_count_for_resolution(pipe, height=384, width=576)` helps compute expected tokens for fixed-shape runs.
+- **Temporal consistency** – attach a persistent spatial cache and per-frame mask controller for webcam/video v2v:
+  - `from temporal_consistency import TemporalConsistencyController, TemporalConsistencyConfig`
+  - `from cache_dit_klein import enable_temporal_consistency`
+  - call it after `prepare_transformer_for_speed(...)` and before `pipe.enable_compile(...)`
+  - `spatial_cache = enable_temporal_consistency(pipe, height=..., width=...)`
+  - `controller = TemporalConsistencyController(TemporalConsistencyConfig(height=..., width=...))`
+  - `attention_kwargs = controller.build_attention_kwargs(frame_tensor, spatial_cache=spatial_cache)`
 - **Ported CUDA kernels** – `cuda_kernels/` contains specialized fused CUDA ops ported from `klein-cuda-c`.
   Build with:
   - `cd cuda_kernels && python3 setup.py build_ext --inplace`

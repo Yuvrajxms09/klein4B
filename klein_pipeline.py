@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import inspect
+import hashlib
 import os
 import time
 from typing import Any, Callable
@@ -31,6 +32,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 from diffusers.pipelines.flux2.pipeline_output import Flux2PipelineOutput
+from cache_dit_klein import Flux2KVCache
 
 
 if is_torch_xla_available():
@@ -251,6 +253,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._cuda_denoiser: Callable[..., torch.Tensor] | None = None
         self._cuda_denoiser_name: str | None = None
         self._klein_c_full_backend: Any | None = None
+        self._temporal_state_signature: tuple[Any, ...] | None = None
+        self._reference_kv_cache: Flux2KVCache | None = None
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -673,6 +677,54 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._timesteps_cache.clear()
         self._image_latent_ids_cache.clear()
         self._prompt_cache.clear()
+        self._clear_temporal_caches()
+
+    def _clear_temporal_caches(self) -> None:
+        self._temporal_state_signature = None
+        self._reference_kv_cache = None
+        spatial_cache = getattr(self, "_temporal_spatial_cache", None)
+        if spatial_cache is not None:
+            spatial_cache.clear()
+        controller = getattr(self, "_temporal_controller", None)
+        if controller is not None:
+            controller.reset_cache()
+
+    @staticmethod
+    def _fingerprint_value(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return ("str", value)
+        if isinstance(value, (int, float, bool)):
+            return value
+        if isinstance(value, list):
+            return tuple(Flux2KleinPipeline._fingerprint_value(item) for item in value)
+        if isinstance(value, PIL.Image.Image):
+            return ("pil", value.mode, value.size, hashlib.sha1(value.tobytes()).hexdigest())
+        if torch.is_tensor(value):
+            tensor = value.detach()
+            return ("tensor", tuple(tensor.shape), str(tensor.dtype), str(tensor.device), int(tensor.data_ptr()))
+        return ("obj", type(value).__name__, id(value))
+
+    def _build_temporal_state_signature(
+        self,
+        *,
+        prompt: str | list[str] | None,
+        prompt_embeds: torch.Tensor | None,
+        negative_prompt_embeds: torch.Tensor | str | list[str] | None,
+        image: Any,
+        attention_kwargs: dict[str, Any] | None,
+    ) -> tuple[Any, ...]:
+        attention_kwargs = attention_kwargs or {}
+        return (
+            self._fingerprint_value(prompt),
+            self._fingerprint_value(prompt_embeds),
+            self._fingerprint_value(negative_prompt_embeds),
+            self._fingerprint_value(image),
+            self._fingerprint_value(attention_kwargs.get("reference_kv_cache_mode")),
+            self._fingerprint_value(attention_kwargs.get("reference_num_tokens")),
+            self._fingerprint_value(attention_kwargs.get("reference_fixed_timestep")),
+        )
 
     def enable_compile(
         self,
@@ -771,6 +823,32 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         joint_attention_kwargs: dict[str, Any] | None,
         context: str,
     ) -> torch.Tensor:
+        joint_attention_kwargs = dict(joint_attention_kwargs or {})
+        spatial_cache = joint_attention_kwargs.get("spatial_cache")
+        mask = joint_attention_kwargs.get("mask")
+        kv_cache = joint_attention_kwargs.pop("kv_cache", None)
+        kv_cache_mode = joint_attention_kwargs.pop("kv_cache_mode", joint_attention_kwargs.pop("reference_kv_cache_mode", None))
+        num_ref_tokens = int(joint_attention_kwargs.pop("num_ref_tokens", joint_attention_kwargs.pop("reference_num_tokens", 0)) or 0)
+        ref_fixed_timestep = float(
+            joint_attention_kwargs.pop("ref_fixed_timestep", joint_attention_kwargs.pop("reference_fixed_timestep", 0.0)) or 0.0
+        )
+        if spatial_cache is not None:
+            if isinstance(timestep, torch.Tensor):
+                step_key = int(timestep.flatten()[0].item())
+            else:
+                step_key = int(timestep)
+            spatial_cache.set_step_key(step_key)
+        if spatial_cache is not None and mask is not None:
+            joint_attention_kwargs["mask"] = spatial_cache.preprocess_mask(mask)
+
+        if kv_cache_mode == "cached" and kv_cache is None:
+            kv_cache = self._reference_kv_cache
+        if kv_cache_mode == "extract" and kv_cache is None:
+            kv_cache = Flux2KVCache(
+                num_double_layers=len(self.transformer.transformer_blocks),
+                num_single_layers=len(self.transformer.single_transformer_blocks),
+            )
+
         use_cuda_denoiser = (
             self._cuda_denoiser is not None
             and hidden_states.device.type == "cuda"
@@ -790,10 +868,12 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 raise TypeError(
                     f"CUDA denoiser '{self._cuda_denoiser_name}' must return torch.Tensor, got {type(noise_pred)}",
                 )
+            if spatial_cache is not None and mask is not None:
+                noise_pred = spatial_cache.sync_with_output_cache(joint_attention_kwargs["mask"], noise_pred)
             return noise_pred
 
         with self.transformer.cache_context(context):
-            return self.transformer(
+            output = self.transformer(
                 hidden_states=hidden_states,  # (B, image_seq_len, C)
                 timestep=timestep / 1000,
                 guidance=None,
@@ -801,8 +881,23 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 txt_ids=txt_ids,
                 img_ids=img_ids,
                 joint_attention_kwargs=joint_attention_kwargs,
+                kv_cache=kv_cache,
+                kv_cache_mode=kv_cache_mode,
+                num_ref_tokens=num_ref_tokens,
+                ref_fixed_timestep=ref_fixed_timestep,
+                spatial_cache=spatial_cache,
+                mask=joint_attention_kwargs.get("mask"),
                 return_dict=False,
-            )[0]
+            )
+        if kv_cache_mode == "extract" and isinstance(output, tuple) and len(output) == 2:
+            noise_pred, kv_cache_out = output
+            if kv_cache_out is not None:
+                self._reference_kv_cache = kv_cache_out
+        else:
+            noise_pred = output[0]
+            if kv_cache_mode == "cached" and kv_cache is None:
+                self._reference_kv_cache = None
+        return noise_pred
 
     def _prepare_denoiser_inputs(
         self,
@@ -1072,8 +1167,21 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
         self._guidance_scale = guidance_scale
         self._attention_kwargs = attention_kwargs
+        self._temporal_controller = (attention_kwargs or {}).get("temporal_controller")
         self._current_timestep = None
         self._interrupt = False
+
+        temporal_signature = self._build_temporal_state_signature(
+            prompt=prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            image=image,
+            attention_kwargs=attention_kwargs,
+        )
+        if self._temporal_state_signature is not None and temporal_signature != self._temporal_state_signature:
+            self.clear_inference_caches()
+            self._clear_temporal_caches()
+        self._temporal_state_signature = temporal_signature
 
         profile_inference = _resolve_inference_profile_flag(profile)
         text_encoder_s = vae_encode_s = transformer_s = vae_decode_s = 0.0

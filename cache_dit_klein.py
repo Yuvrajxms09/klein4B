@@ -14,10 +14,25 @@ from __future__ import annotations
 
 import logging
 import torch
+import torch.nn.functional as F
 from typing import Any
 from types import MethodType
 from pathlib import Path
 from typing import Optional
+
+from diffusers.models.attention_dispatch import dispatch_attention_fn
+from diffusers.models.embeddings import apply_rotary_emb
+from diffusers.models.transformers.transformer_flux2 import (
+    Flux2Attention as DiffusersFlux2Attention,
+    Flux2AttnProcessor as DiffusersFlux2AttnProcessor,
+    Flux2KVAttnProcessor as DiffusersFlux2KVAttnProcessor,
+    Flux2KVParallelSelfAttnProcessor as DiffusersFlux2KVParallelSelfAttnProcessor,
+    Flux2ParallelSelfAttention as DiffusersFlux2ParallelSelfAttention,
+    Flux2ParallelSelfAttnProcessor as DiffusersFlux2ParallelSelfAttnProcessor,
+    _cat_into_buffer,
+    _flux2_kv_causal_attention,
+    _get_qkv_projections,
+)
 
 try:
     from einops import rearrange
@@ -36,6 +51,549 @@ def latent_token_count_for_resolution(pipe: Any, height: int, width: int) -> int
     h = 2 * (int(height) // multiple_of)
     w = 2 * (int(width) // multiple_of)
     return (h // 2) * (w // 2)
+
+
+class SpatialCache:
+    """
+    Per-layer spatial KV cache and output cache for temporal consistency.
+
+    The cache is keyed by the attention module identity, so the wrapper can be
+    reused without depending on block indices.
+    """
+
+    def __init__(
+        self,
+        image_seq_len: int,
+        text_seq_len: int = 512,
+        output_channels: int = 128,
+        attention_head_dim: int = 128,
+        num_attention_heads: int = 24,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        self.image_seq_len = int(image_seq_len)
+        self.text_seq_len = int(text_seq_len)
+        self.full_seq_len = self.text_seq_len + self.image_seq_len
+        self.output_channels = int(output_channels)
+        self.attention_head_dim = int(attention_head_dim)
+        self.num_attention_heads = int(num_attention_heads)
+        self.device = device
+        self.dtype = dtype
+        self.step_key: Any = "default"
+        self._step_states: dict[Any, dict[str, Any]] = {}
+
+    def set_step_key(self, step_key: Any) -> None:
+        self.step_key = step_key
+
+    def _get_state(self) -> dict[str, Any]:
+        state = self._step_states.get(self.step_key)
+        if state is None:
+            state = {
+                "output_cache": torch.zeros(
+                    1, self.image_seq_len, self.output_channels, device=self.device, dtype=self.dtype
+                ),
+                "valid": torch.zeros(1, self.full_seq_len, device=self.device, dtype=torch.bool),
+                "double_block_keys": {},
+                "double_block_values": {},
+                "single_block_keys": {},
+                "single_block_values": {},
+            }
+            self._step_states[self.step_key] = state
+        return state
+
+    def clear(self, step_key: Any | None = None) -> None:
+        if step_key is None:
+            self._step_states.clear()
+            return
+        self._step_states.pop(step_key, None)
+
+    def preprocess_mask(self, input_mask: torch.Tensor) -> torch.Tensor:
+        state = self._get_state()
+        return torch.where(
+            state["valid"] == 0,
+            torch.tensor(2, device=self.device, dtype=torch.int32),
+            input_mask,
+        )
+
+    def sync_with_output_cache(self, mask: torch.Tensor, masked_prediction: torch.Tensor) -> torch.Tensor:
+        state = self._get_state()
+        image_mask = mask[:, self.text_seq_len :]
+        execute_mask = image_mask != 0
+        update_mask = image_mask == 2
+
+        execute_exp = execute_mask.unsqueeze(-1)
+        update_exp = update_mask.unsqueeze(-1)
+
+        output_cache = state["output_cache"]
+        filled_prediction = torch.where(execute_exp, masked_prediction, output_cache)
+        state["output_cache"] = torch.where(update_exp, masked_prediction, output_cache)
+        state["valid"] = torch.logical_or(state["valid"], mask == 2)
+        return filled_prediction
+
+    def sync_with_kv_cache(
+        self,
+        mask: torch.Tensor,
+        masked_keys: torch.Tensor,
+        masked_values: torch.Tensor,
+        block_key: Any,
+        *,
+        block_type: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        state = self._get_state()
+        execute_mask = mask != 0
+        update_mask = mask == 2
+        execute_exp = execute_mask.unsqueeze(-1).unsqueeze(-1)
+        update_exp = update_mask.unsqueeze(-1).unsqueeze(-1)
+
+        key_id = id(block_key)
+        if block_type == "single":
+            cached_keys = state["single_block_keys"].get(key_id)
+            cached_values = state["single_block_values"].get(key_id)
+        elif block_type == "double":
+            cached_keys = state["double_block_keys"].get(key_id)
+            cached_values = state["double_block_values"].get(key_id)
+        else:
+            raise ValueError(f"block_type must be 'single' or 'double', got {block_type}")
+
+        if cached_keys is None or cached_keys.shape != masked_keys.shape:
+            cached_keys = torch.zeros_like(masked_keys)
+        if cached_values is None or cached_values.shape != masked_values.shape:
+            cached_values = torch.zeros_like(masked_values)
+
+        filled_keys = torch.where(execute_exp, masked_keys, cached_keys)
+        filled_values = torch.where(execute_exp, masked_values, cached_values)
+        updated_keys = torch.where(update_exp, masked_keys, cached_keys)
+        updated_values = torch.where(update_exp, masked_values, cached_values)
+
+        if block_type == "single":
+            state["single_block_keys"][key_id] = updated_keys
+            state["single_block_values"][key_id] = updated_values
+        else:
+            state["double_block_keys"][key_id] = updated_keys
+            state["double_block_values"][key_id] = updated_values
+
+        return filled_keys, filled_values
+
+
+class Flux2KVLayerCache:
+    """Per-layer KV cache for reference image tokens."""
+
+    def __init__(self):
+        self.k_ref: torch.Tensor | None = None
+        self.v_ref: torch.Tensor | None = None
+
+    def store(self, k_ref: torch.Tensor, v_ref: torch.Tensor) -> None:
+        self.k_ref = k_ref
+        self.v_ref = v_ref
+
+    def get(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.k_ref is None or self.v_ref is None:
+            raise RuntimeError("KV cache has not been populated yet.")
+        return self.k_ref, self.v_ref
+
+    def clear(self) -> None:
+        self.k_ref = None
+        self.v_ref = None
+
+
+class Flux2KVCache:
+    """Container for all layers' reference-token KV caches."""
+
+    def __init__(self, num_double_layers: int, num_single_layers: int):
+        self.double_block_caches = [Flux2KVLayerCache() for _ in range(num_double_layers)]
+        self.single_block_caches = [Flux2KVLayerCache() for _ in range(num_single_layers)]
+        self.num_ref_tokens: int = 0
+
+    def get_double(self, layer_idx: int) -> Flux2KVLayerCache:
+        return self.double_block_caches[layer_idx]
+
+    def get_single(self, layer_idx: int) -> Flux2KVLayerCache:
+        return self.single_block_caches[layer_idx]
+
+    def clear(self) -> None:
+        for cache in self.double_block_caches:
+            cache.clear()
+        for cache in self.single_block_caches:
+            cache.clear()
+        self.num_ref_tokens = 0
+
+
+def sparse_mlp_compute(
+    mlp_function: Any,
+    mask: torch.Tensor | None,
+    input_hidden_states: torch.Tensor,
+    output_dims: int | None = None,
+):
+    if mask is None:
+        return mlp_function(input_hidden_states)
+
+    seq_mask = mask.squeeze(0)
+    if seq_mask.any():
+        active_idx = seq_mask.nonzero(as_tuple=False).squeeze(-1)
+        mlp_active = input_hidden_states.index_select(1, active_idx)
+        mlp_active_out = mlp_function(mlp_active)
+        mlp_out = torch.zeros(
+            1,
+            input_hidden_states.shape[1],
+            mlp_active_out.shape[-1],
+            device=input_hidden_states.device,
+            dtype=input_hidden_states.dtype,
+        )
+        mlp_out.index_copy_(1, active_idx, mlp_active_out)
+        return mlp_out
+
+    if output_dims is None:
+        sample_out = mlp_function(input_hidden_states[:, :1])
+        output_dims = sample_out.shape[-1]
+
+    return torch.zeros(
+        1,
+        input_hidden_states.shape[1],
+        output_dims,
+        device=input_hidden_states.device,
+        dtype=input_hidden_states.dtype,
+    )
+
+
+def sparse_attention_compute(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask,
+    backend,
+    parallel_config,
+    query_mask: torch.Tensor | None = None,
+):
+    if query_mask is None:
+        return dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            backend=backend,
+            parallel_config=parallel_config,
+        )
+
+    hidden_states = torch.zeros_like(query)
+    seq_mask = query_mask.squeeze(0)
+    if seq_mask.any():
+        active_idx = seq_mask.nonzero(as_tuple=False).squeeze(-1)
+        query_active = query.index_select(1, active_idx)
+        hidden_states_active = dispatch_attention_fn(
+            query_active,
+            key,
+            value,
+            attn_mask=attn_mask,
+            backend=backend,
+            parallel_config=parallel_config,
+        )
+        hidden_states.index_copy_(1, active_idx, hidden_states_active)
+    return hidden_states
+
+
+def _apply_spatial_kv_cache(
+    spatial_cache: SpatialCache | None,
+    mask: torch.Tensor | None,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn: Any,
+    block_type: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if spatial_cache is None or mask is None:
+        return key, value
+    return spatial_cache.sync_with_kv_cache(mask, key, value, attn, block_type=block_type)
+
+
+def _temporal_qkv_projections(
+    attn: DiffusersFlux2Attention,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor | None,
+    mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    if mask is None or getattr(attn, "fused_projections", False):
+        return _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+
+    text_seq_len = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
+    query = sparse_mlp_compute(attn.to_q, mask[:, text_seq_len:], hidden_states, attn.to_q.out_features)
+    key = sparse_mlp_compute(attn.to_k, mask[:, text_seq_len:], hidden_states, attn.to_k.out_features)
+    value = sparse_mlp_compute(attn.to_v, mask[:, text_seq_len:], hidden_states, attn.to_v.out_features)
+
+    encoder_query = encoder_key = encoder_value = None
+    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
+        encoder_query = sparse_mlp_compute(
+            attn.add_q_proj,
+            mask[:, :text_seq_len],
+            encoder_hidden_states,
+            attn.add_q_proj.out_features,
+        )
+        encoder_key = sparse_mlp_compute(
+            attn.add_k_proj,
+            mask[:, :text_seq_len],
+            encoder_hidden_states,
+            attn.add_k_proj.out_features,
+        )
+        encoder_value = sparse_mlp_compute(
+            attn.add_v_proj,
+            mask[:, :text_seq_len],
+            encoder_hidden_states,
+            attn.add_v_proj.out_features,
+        )
+
+    return query, key, value, encoder_query, encoder_key, encoder_value
+
+
+class TemporalFlux2AttnProcessor(DiffusersFlux2AttnProcessor):
+    def __call__(
+        self,
+        attn: DiffusersFlux2Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
+        kv_cache: Any | None = None,
+        kv_cache_mode: str | None = None,
+        num_ref_tokens: int = 0,
+        spatial_cache: SpatialCache | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        query, key, value, encoder_query, encoder_key, encoder_value = _temporal_qkv_projections(
+            attn, hidden_states, encoder_hidden_states, mask
+        )
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if attn.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+
+            encoder_query = attn.norm_added_q(encoder_query)
+            encoder_key = attn.norm_added_k(encoder_key)
+
+            query = _cat_into_buffer(attn, "_joint_query_buffer", (encoder_query, query), dim=1)
+            key = _cat_into_buffer(attn, "_joint_key_buffer", (encoder_key, key), dim=1)
+            value = _cat_into_buffer(attn, "_joint_value_buffer", (encoder_value, value), dim=1)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        key, value = _apply_spatial_kv_cache(spatial_cache, mask, key, value, attn, "double")
+
+        num_txt_tokens = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
+
+        if kv_cache_mode == "extract" and kv_cache is not None and num_ref_tokens > 0:
+            ref_start = num_txt_tokens
+            ref_end = num_txt_tokens + num_ref_tokens
+            kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
+
+        if kv_cache_mode == "extract" and num_ref_tokens > 0:
+            hidden_states = _flux2_kv_causal_attention(
+                query, key, value, num_txt_tokens, num_ref_tokens, backend=self._attention_backend
+            )
+        elif kv_cache_mode == "cached" and kv_cache is not None:
+            hidden_states = _flux2_kv_causal_attention(
+                query, key, value, num_txt_tokens, 0, kv_cache=kv_cache, backend=self._attention_backend
+            )
+        else:
+            hidden_states = sparse_attention_compute(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+                query_mask=mask,
+            )
+
+        hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            )
+            if mask is not None:
+                encoder_hidden_states = sparse_mlp_compute(
+                    attn.to_add_out,
+                    mask[:, : encoder_hidden_states.shape[1]],
+                    encoder_hidden_states,
+                    attn.to_add_out.out_features,
+                )
+            else:
+                encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+        if mask is not None:
+            image_mask = mask[:, encoder_hidden_states.shape[1] :] if encoder_hidden_states is not None else mask
+            hidden_states = sparse_mlp_compute(
+                attn.to_out[0],
+                image_mask,
+                hidden_states,
+                attn.to_out[0].out_features,
+            )
+            hidden_states = sparse_mlp_compute(
+                attn.to_out[1],
+                image_mask,
+                hidden_states,
+                getattr(attn.to_out[1], "out_features", hidden_states.shape[2]),
+            )
+        else:
+            hidden_states = attn.to_out[0](hidden_states)
+            hidden_states = attn.to_out[1](hidden_states)
+
+        if encoder_hidden_states is not None:
+            return hidden_states, encoder_hidden_states
+        return hidden_states
+
+
+class TemporalFlux2KVAttnProcessor(DiffusersFlux2KVAttnProcessor):
+    def __call__(
+        self,
+        attn: DiffusersFlux2Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
+        kv_cache: Any | None = None,
+        kv_cache_mode: str | None = None,
+        num_ref_tokens: int = 0,
+        spatial_cache: SpatialCache | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return TemporalFlux2AttnProcessor.__call__(
+            self,
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=attention_mask,
+            image_rotary_emb=image_rotary_emb,
+            kv_cache=kv_cache,
+            kv_cache_mode=kv_cache_mode,
+            num_ref_tokens=num_ref_tokens,
+            spatial_cache=spatial_cache,
+            mask=mask,
+        )
+
+
+class TemporalFlux2ParallelSelfAttnProcessor(DiffusersFlux2ParallelSelfAttnProcessor):
+    def __call__(
+        self,
+        attn: DiffusersFlux2ParallelSelfAttention,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
+        spatial_cache: SpatialCache | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = (
+            sparse_mlp_compute(attn.to_qkv_mlp_proj, mask, hidden_states, attn.to_qkv_mlp_proj.out_features)
+            if mask is not None
+            else attn.to_qkv_mlp_proj(hidden_states)
+        )
+        qkv, mlp_hidden_states = torch.split(
+            hidden_states, [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor], dim=-1
+        )
+        query, key, value = qkv.chunk(3, dim=-1)
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        key, value = _apply_spatial_kv_cache(spatial_cache, mask, key, value, attn, "single")
+
+        hidden_states = sparse_attention_compute(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            backend=self._attention_backend,
+            parallel_config=self._parallel_config,
+            query_mask=mask,
+        )
+        hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
+        mlp_hidden_states = sparse_mlp_compute(attn.mlp_act_fn, mask, mlp_hidden_states)
+        hidden_states = _cat_into_buffer(attn, "_parallel_out_buffer", (hidden_states, mlp_hidden_states), dim=-1)
+        hidden_states = sparse_mlp_compute(attn.to_out, mask, hidden_states, attn.to_out.out_features)
+        return hidden_states
+
+
+class TemporalFlux2KVParallelSelfAttnProcessor(DiffusersFlux2KVParallelSelfAttnProcessor):
+    def __call__(
+        self,
+        attn: DiffusersFlux2ParallelSelfAttention,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
+        kv_cache: Any | None = None,
+        kv_cache_mode: str | None = None,
+        num_txt_tokens: int = 0,
+        num_ref_tokens: int = 0,
+        spatial_cache: SpatialCache | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states_proj = (
+            sparse_mlp_compute(attn.to_qkv_mlp_proj, mask, hidden_states, attn.to_qkv_mlp_proj.out_features)
+            if mask is not None
+            else attn.to_qkv_mlp_proj(hidden_states)
+        )
+        qkv, mlp_hidden_states = torch.split(
+            hidden_states_proj, [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor], dim=-1
+        )
+        query, key, value = qkv.chunk(3, dim=-1)
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        key, value = _apply_spatial_kv_cache(spatial_cache, mask, key, value, attn, "single")
+
+        if kv_cache_mode == "extract" and kv_cache is not None and num_ref_tokens > 0:
+            ref_start = num_txt_tokens
+            ref_end = num_txt_tokens + num_ref_tokens
+            kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
+
+        if kv_cache_mode == "extract" and num_ref_tokens > 0:
+            attn_output = _flux2_kv_causal_attention(
+                query, key, value, num_txt_tokens, num_ref_tokens, backend=self._attention_backend
+            )
+        elif kv_cache_mode == "cached" and kv_cache is not None:
+            attn_output = _flux2_kv_causal_attention(
+                query, key, value, num_txt_tokens, 0, kv_cache=kv_cache, backend=self._attention_backend
+            )
+        else:
+            attn_output = sparse_attention_compute(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+                query_mask=mask,
+            )
+
+        attn_output = attn_output.flatten(2, 3).to(query.dtype)
+        mlp_hidden_states = sparse_mlp_compute(attn.mlp_act_fn, mask, mlp_hidden_states)
+        hidden_states = _cat_into_buffer(attn, "_parallel_out_buffer", (attn_output, mlp_hidden_states), dim=-1)
+        hidden_states = sparse_mlp_compute(attn.to_out, mask, hidden_states, attn.to_out.out_features)
+        return hidden_states
 
 
 def load_ported_cuda_kernels(module_name: str = "klein_cuda_ext") -> Any:
@@ -986,6 +1544,67 @@ def prepare_transformer_for_speed(
         logger.warning("double-stream projection fusion failed, continuing without it: %s", exc)
     logger.info("selecting attention backend backend=%s", backend)
     return apply_attention_backend(pipe, backend)
+
+
+def enable_temporal_consistency(
+    pipe: Any,
+    *,
+    height: int,
+    width: int,
+    text_seq_len: int = 512,
+    output_channels: int = 128,
+    attention_head_dim: int = 128,
+    num_attention_heads: int = 24,
+    device: str | None = None,
+    dtype: torch.dtype | None = None,
+) -> SpatialCache:
+    """
+    Attach temporal-consistency-aware attention processors and return the cache.
+
+    Keep the returned cache alive across frames and pass its mask via
+    `TemporalConsistencyController.build_attention_kwargs(...)`.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if dtype is None:
+        dtype = getattr(pipe.transformer, "dtype", torch.bfloat16)
+
+    spatial_cache = SpatialCache(
+        image_seq_len=latent_token_count_for_resolution(pipe, height=height, width=width),
+        text_seq_len=text_seq_len,
+        output_channels=output_channels,
+        attention_head_dim=attention_head_dim,
+        num_attention_heads=num_attention_heads,
+        device=device,
+        dtype=dtype,
+    )
+
+    for module in pipe.transformer.modules():
+        if isinstance(module, DiffusersFlux2ParallelSelfAttention):
+            current = getattr(module, "processor", None)
+            if current is None:
+                continue
+            if current.__class__.__name__.startswith("Flux2KV"):
+                new_processor = TemporalFlux2KVParallelSelfAttnProcessor()
+            else:
+                new_processor = TemporalFlux2ParallelSelfAttnProcessor()
+            new_processor._attention_backend = getattr(current, "_attention_backend", None)
+            new_processor._parallel_config = getattr(current, "_parallel_config", None)
+            module.set_processor(new_processor)
+        elif isinstance(module, DiffusersFlux2Attention):
+            current = getattr(module, "processor", None)
+            if current is None:
+                continue
+            if current.__class__.__name__.startswith("Flux2KV"):
+                new_processor = TemporalFlux2KVAttnProcessor()
+            else:
+                new_processor = TemporalFlux2AttnProcessor()
+            new_processor._attention_backend = getattr(current, "_attention_backend", None)
+            new_processor._parallel_config = getattr(current, "_parallel_config", None)
+            module.set_processor(new_processor)
+
+    pipe._temporal_spatial_cache = spatial_cache
+    return spatial_cache
 
 
 def _make_fused_linear_from_linears(linears: list[torch.nn.Linear]) -> torch.nn.Linear:
