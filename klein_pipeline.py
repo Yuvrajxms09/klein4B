@@ -857,13 +857,13 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             kv_cache = self._reference_kv_cache
         if kv_cache_mode == "extract" and kv_cache is None:
             kv_cache = Flux2KVCache(
-                num_double_layers=len(self.transformer.transformer_blocks),
-                num_single_layers=len(self.transformer.single_transformer_blocks),
+                num_double_layers=len(self._get_transformer_module().transformer_blocks),
+                num_single_layers=len(self._get_transformer_module().single_transformer_blocks),
             )
             logger.info(
                 "created reference kv cache num_double_layers=%s num_single_layers=%s",
-                len(self.transformer.transformer_blocks),
-                len(self.transformer.single_transformer_blocks),
+                len(self._get_transformer_module().transformer_blocks),
+                len(self._get_transformer_module().single_transformer_blocks),
             )
         if kv_cache_mode == "extract":
             logger.debug(
@@ -970,7 +970,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         total_seq = latents.shape[1] + image_latents.shape[1]
         batch = latents.shape[0]
         channels = latents.shape[-1]
-        dtype = self.transformer.dtype
+        dtype = self._get_transformer_module().dtype
         device = latents.device
 
         latent_model_input = getattr(self, "_denoiser_input_buffer", None)
