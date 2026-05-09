@@ -78,6 +78,14 @@ class SpatialCache:
 
     The cache is keyed by the attention module identity, so the wrapper can be
     reused without depending on block indices.
+
+    Mask layouts (FluxRT-compatible):
+
+    - ``(1, text_seq_len + image_seq_len)``: already aligned to joint sequence (text + all image tokens).
+    - ``(1, text_seq_len + 2 * main + ref)``: duplicated main-latent mask (FluxRT pipeline) plus optional
+      reference tail ``ref`` packed tokens. When ``ref_packed_seq_len > 0``, this is normalized to
+      ``text + main + ref`` via ``max(main_a, main_b)`` on the two main arms (same as the no-ref dup case,
+      extended with a reference segment).
     """
 
     def __init__(
@@ -89,9 +97,23 @@ class SpatialCache:
         num_attention_heads: int = 24,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        *,
+        main_packed_seq_len: int | None = None,
+        ref_packed_seq_len: int = 0,
     ):
+        self.ref_packed_seq_len = int(ref_packed_seq_len)
+        self.main_packed_seq_len = (
+            int(main_packed_seq_len)
+            if main_packed_seq_len is not None
+            else int(image_seq_len) - self.ref_packed_seq_len
+        )
         self.image_seq_len = int(image_seq_len)
         self.text_seq_len = int(text_seq_len)
+        if self.main_packed_seq_len + self.ref_packed_seq_len != self.image_seq_len:
+            raise ValueError(
+                "SpatialCache layout mismatch: main_packed_seq_len + ref_packed_seq_len must equal "
+                f"image_seq_len (got {self.main_packed_seq_len} + {self.ref_packed_seq_len} != {self.image_seq_len})"
+            )
         self.full_seq_len = self.text_seq_len + self.image_seq_len
         self.output_channels = int(output_channels)
         self.attention_head_dim = int(attention_head_dim)
@@ -112,6 +134,11 @@ class SpatialCache:
         )
 
     def set_step_key(self, step_key: Any) -> None:
+        """
+        Select per-step cache buckets. ``step_key`` is usually an int scheduler timestep, or
+        ``(timestep_int, cache_context)`` (e.g. ``("cond"|"uncond")``) so CFG branches do not
+        share KV / validity state — matching ``transformer.cache_context`` usage in FluxRT.
+        """
         if step_key != self.step_key and logger.isEnabledFor(logging.DEBUG):
             logger.debug("spatial cache step key change old=%s new=%s", self.step_key, step_key)
         self.step_key = step_key
@@ -155,12 +182,33 @@ class SpatialCache:
 
         if input_mask.shape[1] == self.full_seq_len:
             normalized_mask = input_mask
-        elif input_mask.shape[1] == self.text_seq_len + 2 * self.image_seq_len:
+        elif (
+            self.ref_packed_seq_len > 0
+            and input_mask.shape[1]
+            == self.text_seq_len + 2 * self.main_packed_seq_len + self.ref_packed_seq_len
+        ):
             text_mask = input_mask[:, : self.text_seq_len]
-            image_mask_a = input_mask[:, self.text_seq_len : self.text_seq_len + self.image_seq_len]
-            image_mask_b = input_mask[
-                :, self.text_seq_len + self.image_seq_len : self.text_seq_len + 2 * self.image_seq_len
-            ]
+            m = self.main_packed_seq_len
+            r = self.ref_packed_seq_len
+            image_mask_a = input_mask[:, self.text_seq_len : self.text_seq_len + m]
+            image_mask_b = input_mask[:, self.text_seq_len + m : self.text_seq_len + 2 * m]
+            ref_mask = input_mask[:, self.text_seq_len + 2 * m : self.text_seq_len + 2 * m + r]
+            normalized_mask = torch.cat(
+                [text_mask, torch.maximum(image_mask_a, image_mask_b), ref_mask],
+                dim=-1,
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "spatial cache normalized mask dup+ref step_key=%s in=%s out=%s",
+                    self.step_key,
+                    input_mask.shape[1],
+                    normalized_mask.shape[1],
+                )
+        elif input_mask.shape[1] == self.text_seq_len + 2 * self.main_packed_seq_len:
+            text_mask = input_mask[:, : self.text_seq_len]
+            m = self.main_packed_seq_len
+            image_mask_a = input_mask[:, self.text_seq_len : self.text_seq_len + m]
+            image_mask_b = input_mask[:, self.text_seq_len + m : self.text_seq_len + 2 * m]
             normalized_mask = torch.cat(
                 [text_mask, torch.maximum(image_mask_a, image_mask_b)],
                 dim=-1,
@@ -176,12 +224,23 @@ class SpatialCache:
             raise ValueError(
                 "unexpected mask length: got "
                 f"{input_mask.shape[1]}, expected {self.full_seq_len} or "
-                f"{self.text_seq_len + 2 * self.image_seq_len}"
+                f"{self.text_seq_len + 2 * self.main_packed_seq_len}"
+                + (
+                    f" or {self.text_seq_len + 2 * self.main_packed_seq_len + self.ref_packed_seq_len}"
+                    if self.ref_packed_seq_len
+                    else ""
+                )
             )
 
+        valid = state["valid"]
+        if normalized_mask.device != valid.device:
+            normalized_mask = normalized_mask.to(device=valid.device)
+        if normalized_mask.dtype != torch.int32:
+            normalized_mask = normalized_mask.to(dtype=torch.int32)
+
         processed = torch.where(
-            state["valid"] == 0,
-            torch.tensor(2, device=self.device, dtype=torch.int32),
+            valid == 0,
+            torch.tensor(2, device=valid.device, dtype=torch.int32),
             normalized_mask,
         )
         if logger.isEnabledFor(logging.DEBUG):
@@ -196,24 +255,41 @@ class SpatialCache:
 
     def sync_with_output_cache(self, mask: torch.Tensor, masked_prediction: torch.Tensor) -> torch.Tensor:
         state = self._get_state()
+        output_cache = state["output_cache"]
+        if mask.device != masked_prediction.device:
+            mask = mask.to(device=masked_prediction.device)
+        if output_cache.device != masked_prediction.device:
+            dev = masked_prediction.device
+            output_cache = output_cache.to(device=dev)
+            state["output_cache"] = output_cache
+            state["valid"] = state["valid"].to(device=dev)
+        pred = masked_prediction
+        if pred.dtype != output_cache.dtype:
+            pred = pred.to(dtype=output_cache.dtype)
+
         image_mask = mask[:, self.text_seq_len :]
+        if image_mask.shape[1] != pred.shape[1]:
+            raise ValueError(
+                "sync_with_output_cache length mismatch: image_mask tokens "
+                f"{image_mask.shape[1]} vs prediction seq {pred.shape[1]} "
+                f"(text_seq_len={self.text_seq_len}, image_seq_len={self.image_seq_len})"
+            )
         execute_mask = image_mask != 0
         update_mask = image_mask == 2
 
         execute_exp = execute_mask.unsqueeze(-1)
         update_exp = update_mask.unsqueeze(-1)
 
-        output_cache = state["output_cache"]
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "spatial cache output sync step_key=%s mask_counts=%s prediction_shape=%s cache_shape=%s",
                 self.step_key,
                 self._mask_counts(mask),
-                tuple(masked_prediction.shape),
+                tuple(pred.shape),
                 tuple(output_cache.shape),
             )
-        filled_prediction = torch.where(execute_exp, masked_prediction, output_cache)
-        state["output_cache"] = torch.where(update_exp, masked_prediction, output_cache)
+        filled_prediction = torch.where(execute_exp, pred, output_cache)
+        state["output_cache"] = torch.where(update_exp, pred, output_cache)
         state["valid"] = torch.logical_or(state["valid"], mask == 2)
         return filled_prediction
 
@@ -829,6 +905,19 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         torch.backends.cuda.enable_mem_efficient_sdp(True)
         torch.backends.cuda.enable_math_sdp(False)
     except Exception:
+        pass
+
+    try:
+        from temporal_flux2_transformer import TemporalFlux2Transformer2DModel
+
+        if isinstance(transformer, TemporalFlux2Transformer2DModel):
+            if verbose:
+                logger.info(
+                    "skip apply_flux2_transformer_klein_ops block.forward repatching on "
+                    "TemporalFlux2Transformer2DModel (keeps FluxRT-aligned double-stream FFN)"
+                )
+            return transformer
+    except ImportError:
         pass
 
     def _split_qkv_heads(qkv: torch.Tensor, num_heads: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1733,26 +1822,58 @@ def enable_temporal_consistency(
     num_attention_heads: int = 24,
     device: str | None = None,
     dtype: torch.dtype | None = None,
+    packed_reference_tokens: int = 0,
 ) -> SpatialCache:
     """
     Attach temporal-consistency-aware attention processors and return the cache.
 
     Keep the returned cache alive across frames and pass its mask via
     `TemporalConsistencyController.build_attention_kwargs(...)`.
+
+    Also swaps the diffusers transformer for ``TemporalFlux2Transformer2DModel`` (FluxRT-aligned
+    double-stream FFN masking and output projection / output-cache tail). Processors are installed
+    **after** that swap so attention modules are the final instances.
+
+    Args:
+        packed_reference_tokens: Number of **packed** latent tokens for reference image(s) concatenated
+            after the main latents (same convention as ``latent_model_input``). When >0, the spatial
+            cache accepts FluxRT-style masks ``text + 2 * main + ref`` and normalizes like the no-ref
+            duplicate-main case, keeping the reference tail intact.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     if dtype is None:
         dtype = getattr(pipe.transformer, "dtype", torch.bfloat16)
 
+    from temporal_flux2_transformer import convert_transformer_for_temporal
+
+    inner = getattr(pipe.transformer, "_orig_mod", pipe.transformer)
+    if getattr(pipe.transformer, "_orig_mod", None) is not None:
+        logger.warning(
+            "enable_temporal_consistency: stripping torch.compile wrapper from transformer; re-compile after enabling temporal if needed"
+        )
+    converted = convert_transformer_for_temporal(inner)
+    pipe.transformer = converted
+    if hasattr(pipe, "_transformer_module"):
+        pipe._transformer_module = converted
+
+    tr_cfg = getattr(converted, "config", None)
+    if tr_cfg is not None:
+        num_attention_heads = int(getattr(tr_cfg, "num_attention_heads", num_attention_heads))
+        attention_head_dim = int(getattr(tr_cfg, "attention_head_dim", attention_head_dim))
+
+    main_tokens = latent_token_count_for_resolution(pipe, height=height, width=width)
+    ref_tokens = int(packed_reference_tokens)
     spatial_cache = SpatialCache(
-        image_seq_len=latent_token_count_for_resolution(pipe, height=height, width=width),
+        image_seq_len=main_tokens + ref_tokens,
         text_seq_len=text_seq_len,
         output_channels=output_channels,
         attention_head_dim=attention_head_dim,
         num_attention_heads=num_attention_heads,
         device=device,
         dtype=dtype,
+        main_packed_seq_len=main_tokens,
+        ref_packed_seq_len=ref_tokens,
     )
 
     for module in pipe.transformer.modules():

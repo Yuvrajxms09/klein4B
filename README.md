@@ -26,6 +26,21 @@ We tried a lighter VAE (TAEF2) for faster encode/decode; it reduced output quali
   - `spatial_cache = enable_temporal_consistency(pipe, height=..., width=...)`
   - `controller = TemporalConsistencyController(TemporalConsistencyConfig(height=..., width=...))`
   - `attention_kwargs = controller.build_attention_kwargs(frame_tensor, spatial_cache=spatial_cache)`
+- **Webcam orchestrator** – `webcam_orchestrator.py` serves a thin local browser UI:
+  - runs the `klein4B` pipeline directly
+  - captures webcam frames in the browser
+  - sends one frame at a time to `/infer`
+  - optionally enables FluxRT-style frame interpolation for smoother playback
+  - keeps temporal cache state alive across frames
+  - start it with `python webcam_orchestrator.py --model-dir /path/to/FLUX.2-klein-4B`
+  - add `--interpolate --interpolation-exp 1` to enable RIFE interpolation between generated frames
+- **FluxRT-style webcam stream processor** – `webcam_stream_processor.py` mirrors the FluxRT split runtime:
+  - model inference runs in a separate subprocess
+  - output smoothing is handled by a separate scheduler subprocess
+  - shared tensors carry webcam input and rendered output between processes
+  - start it with `python webcam_stream_processor.py --model-dir /path/to/FLUX.2-klein-4B`
+  - add `--interpolate --interpolation-exp 1` for the FluxRT-style RIFE batch smoothing
+  - requires `opencv-python` from `requirements.txt`
 - **Ported CUDA kernels** – `cuda_kernels/` contains specialized fused CUDA ops ported from `klein-cuda-c`.
   Build with:
   - `cd cuda_kernels && python3 setup.py build_ext --inplace`

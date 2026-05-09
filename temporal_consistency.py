@@ -7,6 +7,7 @@ import numpy as np
 import time
 import torch
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 from PIL import Image as PILImage
 
 
@@ -70,7 +71,9 @@ class TemporalConsistencyController:
 
         self.manual_mask: torch.Tensor | None = None
 
-    def _to_bchw(self, frame: torch.Tensor | np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def _to_bchw(
+        self, frame: torch.Tensor | np.ndarray | PILImage.Image, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
         if isinstance(frame, PILImage.Image):
             if frame.size != (self.width, self.height):
                 frame = frame.resize((self.width, self.height), resample=PILImage.Resampling.BILINEAR)
@@ -135,9 +138,10 @@ class TemporalConsistencyController:
                 (1, self.mask_height, self.mask_width), 2, device=self.device, dtype=torch.int32
             )
 
-        frame_small = F.avg_pool2d(frame, kernel_size=3, stride=1, padding=1)
-        cached_small = F.avg_pool2d(self.cached_frame, kernel_size=3, stride=1, padding=1)
-        difference = (cached_small - frame_small).pow(2).mean(dim=1, keepdim=True)
+        # Match FluxRT UpdateController: small Gaussian blur before frame diff (not avg_pool).
+        frame_blurred = TF.gaussian_blur(frame, kernel_size=3, sigma=0.5)
+        cached_blurred = TF.gaussian_blur(self.cached_frame, kernel_size=3, sigma=0.5)
+        difference = (cached_blurred - frame_blurred).pow(2).mean(dim=1, keepdim=True)
 
         difference_mask = F.max_pool2d(difference, (self.compression_ratio, self.compression_ratio))
         difference_mask = difference_mask > 0.1
@@ -189,7 +193,7 @@ class TemporalConsistencyController:
         ref_mask = self.use_reference_image_mask()
         if ref_mask is not None:
             mask = torch.cat([mask, ref_mask], dim=-1)
-        kwargs: dict[str, Any] = {"mask": mask}
+        kwargs: dict[str, Any] = {"mask": mask, "temporal_controller": self}
         if spatial_cache is not None:
             kwargs["spatial_cache"] = spatial_cache
         return kwargs

@@ -10,3 +10,5 @@ numpy>=1.26.0
 pillow>=10.0.0
 # Cache-DiT for faster transformer steps (optional but recommended)
 cache-dit>=0.3.0
+# Webcam stream processor only
+opencv-python>=4.10.0.84

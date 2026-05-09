@@ -848,11 +848,12 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         )
         if spatial_cache is not None:
             if isinstance(timestep, torch.Tensor):
-                step_key = int(timestep.flatten()[0].item())
+                step_int = int(timestep.flatten()[0].item())
             else:
-                step_key = int(timestep)
-            spatial_cache.set_step_key(step_key)
-            logger.debug("spatial cache step key set step_key=%s context=%s", step_key, context)
+                step_int = int(timestep)
+            # Isolate cache buckets per CFG branch (cond vs uncond share the same SpatialCache instance).
+            spatial_cache.set_step_key((step_int, context))
+            logger.debug("spatial cache step key set step_key=%s context=%s", (step_int, context), context)
 
         if kv_cache_mode == "cached" and kv_cache is None:
             kv_cache = self._reference_kv_cache
@@ -883,7 +884,22 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             self._cuda_denoiser is not None
             and hidden_states.device.type == "cuda"
         )
-        processed_mask = spatial_cache.preprocess_mask(mask) if spatial_cache is not None and mask is not None else mask
+        tr_inner = self._get_transformer_module()
+        try:
+            from temporal_flux2_transformer import TemporalFlux2Transformer2DModel
+
+            _temporal_tr = isinstance(tr_inner, TemporalFlux2Transformer2DModel)
+        except ImportError:
+            _temporal_tr = False
+        if spatial_cache is not None and mask is not None:
+            if use_cuda_denoiser:
+                processed_mask = spatial_cache.preprocess_mask(mask)
+            elif _temporal_tr:
+                processed_mask = mask
+            else:
+                processed_mask = spatial_cache.preprocess_mask(mask)
+        else:
+            processed_mask = mask
         denoiser_kwargs = dict(joint_attention_kwargs)
         if processed_mask is not None:
             denoiser_kwargs["mask"] = processed_mask
