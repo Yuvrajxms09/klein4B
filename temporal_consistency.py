@@ -8,6 +8,7 @@ import logging
 import time
 import torch
 import torch.nn.functional as F
+from PIL import Image as PILImage
 
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,8 @@ class TemporalConsistencyController:
 
     @staticmethod
     def _to_bchw(frame: torch.Tensor | np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if isinstance(frame, PILImage.Image):
+            frame = np.array(frame, copy=True)
         if isinstance(frame, np.ndarray):
             frame = torch.from_numpy(frame)
         if frame.ndim == 3 and frame.shape[0] == 3:
