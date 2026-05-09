@@ -228,8 +228,8 @@ class SpatialCache:
         state = self._get_state()
         execute_mask = mask != 0
         update_mask = mask == 2
-        execute_exp = execute_mask.unsqueeze(-1).unsqueeze(-1)
-        update_exp = update_mask.unsqueeze(-1).unsqueeze(-1)
+        execute_idx = execute_mask.squeeze(0).nonzero(as_tuple=False).squeeze(-1)
+        update_idx = update_mask.squeeze(0).nonzero(as_tuple=False).squeeze(-1)
 
         key_id = id(block_key)
         if block_type == "single":
@@ -248,10 +248,17 @@ class SpatialCache:
         if cached_values is None or cached_values.shape != masked_values.shape:
             cached_values = torch.zeros_like(masked_values)
 
-        filled_keys = torch.where(execute_exp, masked_keys, cached_keys)
-        filled_values = torch.where(execute_exp, masked_values, cached_values)
-        updated_keys = torch.where(update_exp, masked_keys, cached_keys)
-        updated_values = torch.where(update_exp, masked_values, cached_values)
+        filled_keys = cached_keys.clone()
+        filled_values = cached_values.clone()
+        if execute_idx.numel() > 0:
+            filled_keys.index_copy_(1, execute_idx, masked_keys.index_select(1, execute_idx))
+            filled_values.index_copy_(1, execute_idx, masked_values.index_select(1, execute_idx))
+
+        updated_keys = cached_keys.clone()
+        updated_values = cached_values.clone()
+        if update_idx.numel() > 0:
+            updated_keys.index_copy_(1, update_idx, masked_keys.index_select(1, update_idx))
+            updated_values.index_copy_(1, update_idx, masked_values.index_select(1, update_idx))
 
         if block_type == "single":
             state["single_block_keys"][key_id] = updated_keys
