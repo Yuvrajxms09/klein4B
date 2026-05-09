@@ -44,6 +44,7 @@ else:
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+logger.disabled = True
 
 # Enable with __call__(..., profile=True) or env FLUX2_KLEIN_PROFILE=1
 _FLUX2_KLEIN_PROFILE_ENV = "FLUX2_KLEIN_PROFILE"

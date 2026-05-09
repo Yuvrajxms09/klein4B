@@ -47,6 +47,7 @@ except Exception:  # pragma: no cover - optional dependency in some envs
 
 
 logger = logging.getLogger(__name__)
+logger.disabled = True
 
 
 def _get_transformer_config(pipe: Any) -> Any:
@@ -1141,8 +1142,6 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn = self.attn
         norm = self.norm
-        if verbose:
-            print("[klein] single block", type(self).__name__, "hidden", tuple(hidden_states.shape))
         if encoder_hidden_states is not None:
             text_seq_len = encoder_hidden_states.shape[1]
             hidden_states = _cat_into_buffer((encoder_hidden_states, hidden_states), self, "single_hidden_states", dim=1)
@@ -1230,8 +1229,6 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         joint_attention_kwargs = joint_attention_kwargs or {}
-        if verbose:
-            print("[klein] double block", type(self).__name__, "img", tuple(hidden_states.shape), "txt", tuple(encoder_hidden_states.shape))
         (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = _split_modulation(temb_mod_img)
         (c_shift_msa, c_scale_msa, c_gate_msa), (c_shift_mlp, c_scale_mlp, c_gate_mlp) = _split_modulation(temb_mod_txt)
 
@@ -1264,14 +1261,6 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                         q_context_3d = _seq_major_from_bhq(q_context)
                         k_context_3d = _seq_major_from_bhq(k_context)
                         v_context_3d = _seq_major_from_bhq(v_context)
-                        if verbose:
-                            logger.info(
-                                "double_stream_joint_packed_attention seq_hidden=%s seq_context=%s heads=%s head_dim=%s",
-                                q_hidden_3d.shape[0],
-                                q_context_3d.shape[0],
-                                q_hidden_3d.shape[1],
-                                q_hidden_3d.shape[2],
-                            )
                         attn_hidden, attn_context = ns.joint_packed_attention_(
                             q_hidden_3d,
                             k_hidden_3d,
@@ -1844,8 +1833,6 @@ def fuse_flux2_double_stream_attention_projections(transformer: Any) -> int:
             fused_blocks += 1
         except Exception:
             continue
-    if fused_blocks:
-        print(f"flux2_double_stream_attention_fused_blocks={fused_blocks}")
     return fused_blocks
 
 
