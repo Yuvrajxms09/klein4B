@@ -29,10 +29,16 @@ from diffusers.models.transformers.transformer_flux2 import (
     Flux2KVParallelSelfAttnProcessor as DiffusersFlux2KVParallelSelfAttnProcessor,
     Flux2ParallelSelfAttention as DiffusersFlux2ParallelSelfAttention,
     Flux2ParallelSelfAttnProcessor as DiffusersFlux2ParallelSelfAttnProcessor,
-    _cat_into_buffer,
     _flux2_kv_causal_attention,
     _get_qkv_projections,
 )
+
+try:  # diffusers private helper changed across releases
+    from diffusers.models.transformers.transformer_flux2 import _cat_into_buffer
+except Exception:  # pragma: no cover - compatibility fallback
+    def _cat_into_buffer(module: Any, name: str, parts: tuple[torch.Tensor, ...], dim: int = -1) -> torch.Tensor:
+        del module, name
+        return torch.cat(parts, dim=dim)
 
 try:
     from einops import rearrange
