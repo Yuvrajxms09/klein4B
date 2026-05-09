@@ -79,9 +79,10 @@ class TemporalConsistencyController:
             self.debug,
         )
 
-    @staticmethod
-    def _to_bchw(frame: torch.Tensor | np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def _to_bchw(self, frame: torch.Tensor | np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if isinstance(frame, PILImage.Image):
+            if frame.size != (self.width, self.height):
+                frame = frame.resize((self.width, self.height), resample=PILImage.Resampling.BILINEAR)
             frame = np.array(frame, copy=True)
         if isinstance(frame, np.ndarray):
             frame = torch.from_numpy(frame)
@@ -91,6 +92,8 @@ class TemporalConsistencyController:
             frame = frame.permute(2, 0, 1).unsqueeze(0)
         if frame.ndim != 4 or frame.shape[1] != 3:
             raise ValueError("frame must be [1, 3, H, W], [3, H, W], or [H, W, 3]")
+        if frame.shape[-2:] != (self.height, self.width):
+            frame = F.interpolate(frame.to(device=device, dtype=torch.float32), size=(self.height, self.width), mode="bilinear", align_corners=False)
         return frame.to(device=device, dtype=dtype)
 
     def set_mask(self, mask: torch.Tensor | np.ndarray) -> None:
