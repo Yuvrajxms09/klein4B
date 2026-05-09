@@ -678,6 +678,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._image_latent_ids_cache.clear()
         self._prompt_cache.clear()
         self._clear_temporal_caches()
+        logger.info("inference caches cleared including temporal state")
 
     def _clear_temporal_caches(self) -> None:
         self._temporal_state_signature = None
@@ -688,6 +689,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         controller = getattr(self, "_temporal_controller", None)
         if controller is not None:
             controller.reset_cache()
+        logger.info("temporal caches cleared")
 
     @staticmethod
     def _fingerprint_value(value: Any) -> Any:
@@ -832,12 +834,22 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         ref_fixed_timestep = float(
             joint_attention_kwargs.pop("ref_fixed_timestep", joint_attention_kwargs.pop("reference_fixed_timestep", 0.0)) or 0.0
         )
+        logger.debug(
+            "run denoiser context=%s mask_present=%s spatial_cache=%s kv_mode=%s num_ref_tokens=%s ref_fixed_timestep=%.4f",
+            context,
+            mask is not None,
+            spatial_cache is not None,
+            kv_cache_mode,
+            num_ref_tokens,
+            ref_fixed_timestep,
+        )
         if spatial_cache is not None:
             if isinstance(timestep, torch.Tensor):
                 step_key = int(timestep.flatten()[0].item())
             else:
                 step_key = int(timestep)
             spatial_cache.set_step_key(step_key)
+            logger.debug("spatial cache step key set step_key=%s context=%s", step_key, context)
         if spatial_cache is not None and mask is not None:
             joint_attention_kwargs["mask"] = spatial_cache.preprocess_mask(mask)
 
@@ -847,6 +859,23 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             kv_cache = Flux2KVCache(
                 num_double_layers=len(self.transformer.transformer_blocks),
                 num_single_layers=len(self.transformer.single_transformer_blocks),
+            )
+            logger.info(
+                "created reference kv cache num_double_layers=%s num_single_layers=%s",
+                len(self.transformer.transformer_blocks),
+                len(self.transformer.single_transformer_blocks),
+            )
+        if kv_cache_mode == "extract":
+            logger.debug(
+                "reference kv extract requested num_ref_tokens=%s ref_fixed_timestep=%.4f",
+                num_ref_tokens,
+                ref_fixed_timestep,
+            )
+        elif kv_cache_mode == "cached":
+            logger.debug(
+                "reference kv cached requested cache_present=%s num_ref_tokens=%s",
+                kv_cache is not None,
+                num_ref_tokens,
             )
 
         use_cuda_denoiser = (
@@ -870,6 +899,12 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 )
             if spatial_cache is not None and mask is not None:
                 noise_pred = spatial_cache.sync_with_output_cache(joint_attention_kwargs["mask"], noise_pred)
+            logger.debug(
+                "cuda denoiser output shape=%s context=%s kv_mode=%s",
+                tuple(noise_pred.shape),
+                context,
+                kv_cache_mode,
+            )
             return noise_pred
 
         with self.transformer.cache_context(context):
@@ -893,10 +928,22 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             noise_pred, kv_cache_out = output
             if kv_cache_out is not None:
                 self._reference_kv_cache = kv_cache_out
+                logger.info(
+                    "reference kv cache extracted and stored num_ref_tokens=%s context=%s",
+                    getattr(kv_cache_out, "num_ref_tokens", None),
+                    context,
+                )
         else:
             noise_pred = output[0]
             if kv_cache_mode == "cached" and kv_cache is None:
                 self._reference_kv_cache = None
+        logger.debug(
+            "denoiser completed output_shape=%s context=%s kv_mode=%s spatial_cache=%s",
+            tuple(noise_pred.shape),
+            context,
+            kv_cache_mode,
+            spatial_cache is not None,
+        )
         return noise_pred
 
     def _prepare_denoiser_inputs(
@@ -1179,8 +1226,14 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             attention_kwargs=attention_kwargs,
         )
         if self._temporal_state_signature is not None and temporal_signature != self._temporal_state_signature:
+            logger.info(
+                "temporal state changed, clearing caches old_signature=%s new_signature=%s",
+                self._temporal_state_signature,
+                temporal_signature,
+            )
             self.clear_inference_caches()
-            self._clear_temporal_caches()
+        elif self._temporal_state_signature is None:
+            logger.debug("temporal state initialized signature=%s", temporal_signature)
         self._temporal_state_signature = temporal_signature
 
         profile_inference = _resolve_inference_profile_flag(profile)

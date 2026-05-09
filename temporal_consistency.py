@@ -4,9 +4,13 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import logging
 import time
 import torch
 import torch.nn.functional as F
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -21,6 +25,7 @@ class TemporalConsistencyConfig:
     always_update_image_cache: bool = True
     mask_calculation_method: str = "auto"
     reference_image_seq_len: int | None = None
+    debug: bool = False
 
 
 class TemporalConsistencyController:
@@ -51,6 +56,7 @@ class TemporalConsistencyController:
         self.reset_period = config.reset_period
         self.always_update_image_cache = config.always_update_image_cache
         self.mask_calculation_method = config.mask_calculation_method
+        self.debug = bool(config.debug)
 
         self.requires_reset = False
         self.requires_update_image_cache = True
@@ -59,6 +65,18 @@ class TemporalConsistencyController:
         self.previous_reset = time.time() if self.reset_period is not None else 0.0
 
         self.manual_mask: torch.Tensor | None = None
+
+        logger.info(
+            "temporal controller init height=%s width=%s compression_ratio=%s text_seq_len=%s ref_seq_len=%s reset_period=%s manual=%s debug=%s",
+            self.height,
+            self.width,
+            self.compression_ratio,
+            self.text_seq_len,
+            self.reference_image_seq_len,
+            self.reset_period,
+            self.mask_calculation_method == "manual",
+            self.debug,
+        )
 
     @staticmethod
     def _to_bchw(frame: torch.Tensor | np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -80,9 +98,17 @@ class TemporalConsistencyController:
         if mask.ndim == 2:
             mask = mask.unsqueeze(0)
         self.manual_mask = mask.to(device=self.device, dtype=torch.int32)
+        if self.debug or logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "temporal controller manual mask set shape=%s active=%s",
+                tuple(self.manual_mask.shape),
+                int((self.manual_mask != 0).sum().item()),
+            )
 
     def update_image_cache(self) -> None:
         self.requires_update_image_cache = True
+        if self.debug or logger.isEnabledFor(logging.DEBUG):
+            logger.debug("temporal controller image cache marked dirty")
 
     def reset_cache(self) -> None:
         self.requires_reset = True
@@ -90,24 +116,44 @@ class TemporalConsistencyController:
         self.reference_image_is_valid = False
         if self.reset_period is not None:
             self.previous_reset = time.time()
+        logger.info("temporal controller cache reset requested")
+
+    @staticmethod
+    def _mask_counts(mask: torch.Tensor) -> dict[str, int]:
+        return {
+            "skip": int((mask == 0).sum().item()),
+            "execute": int((mask == 1).sum().item()),
+            "update": int((mask == 2).sum().item()),
+        }
 
     def update_and_get_mask(self, frame: torch.Tensor | np.ndarray) -> torch.Tensor:
         if self.mask_calculation_method == "manual":
             if self.manual_mask is None:
+                logger.warning("temporal controller manual mode requested but no mask was set; returning zeros")
                 return torch.zeros(
                     1, self.mask_height, self.mask_width, device=self.device, dtype=torch.int32
+                )
+            if self.debug or logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "temporal controller manual mask used shape=%s counts=%s",
+                    tuple(self.manual_mask.shape),
+                    self._mask_counts(self.manual_mask),
                 )
             return self.manual_mask
 
         frame = self._to_bchw(frame, self.device, self.dtype)
+        if self.debug or logger.isEnabledFor(logging.DEBUG):
+            logger.debug("temporal controller frame received shape=%s dtype=%s device=%s", tuple(frame.shape), frame.dtype, frame.device)
 
         if self.reset_period is not None and time.time() - float(self.previous_reset) > float(self.reset_period):
             self.requires_reset = True
+            logger.info("temporal controller reset period elapsed reset_period=%s", self.reset_period)
 
         if self.requires_reset:
             self.cached_frame = frame
             self.previous_reset = time.time()
             self.requires_reset = False
+            logger.info("temporal controller hard reset applied frame cached and mask forced to update")
             return torch.full(
                 (1, self.mask_height, self.mask_width), 2, device=self.device, dtype=torch.int32
             )
@@ -120,6 +166,13 @@ class TemporalConsistencyController:
         difference_mask = difference_mask > 0.1
         difference_mask = F.max_pool2d(difference_mask.float(), kernel_size=3, stride=1, padding=1) > 0
         difference_mask = F.max_pool2d(difference_mask.float(), kernel_size=3, stride=1, padding=1) > 0
+
+        if self.debug or logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "temporal controller diff stats mean=%.6f max=%.6f threshold=0.1",
+                float(difference.mean().item()),
+                float(difference.max().item()),
+            )
 
         difference_mask_up = F.interpolate(
             difference_mask.float(), size=(self.height, self.width), mode="nearest"
@@ -134,7 +187,13 @@ class TemporalConsistencyController:
         if self.requires_update_image_cache:
             if not self.always_update_image_cache:
                 self.requires_update_image_cache = False
+            logger.info(
+                "temporal controller forcing image-cache update counts=%s",
+                self._mask_counts(image_mask * 2),
+            )
             return image_mask * 2
+        if self.debug or logger.isEnabledFor(logging.DEBUG):
+            logger.debug("temporal controller computed image mask counts=%s", self._mask_counts(image_mask))
         return image_mask
 
     def use_text_mask(self) -> torch.Tensor:
@@ -172,4 +231,12 @@ class TemporalConsistencyController:
         if spatial_cache is not None:
             kwargs["spatial_cache"] = spatial_cache
         kwargs["temporal_controller"] = self
+        if self.debug or logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "temporal controller attention kwargs built mask_shape=%s counts=%s has_spatial_cache=%s has_ref_mask=%s",
+                tuple(mask.shape),
+                self._mask_counts(mask),
+                spatial_cache is not None,
+                ref_mask is not None,
+            )
         return kwargs

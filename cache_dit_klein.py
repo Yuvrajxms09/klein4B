@@ -81,8 +81,20 @@ class SpatialCache:
         self.dtype = dtype
         self.step_key: Any = "default"
         self._step_states: dict[Any, dict[str, Any]] = {}
+        logger.info(
+            "spatial cache init image_seq_len=%s text_seq_len=%s output_channels=%s heads=%s head_dim=%s device=%s dtype=%s",
+            self.image_seq_len,
+            self.text_seq_len,
+            self.output_channels,
+            self.num_attention_heads,
+            self.attention_head_dim,
+            self.device,
+            self.dtype,
+        )
 
     def set_step_key(self, step_key: Any) -> None:
+        if step_key != self.step_key and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("spatial cache step key change old=%s new=%s", self.step_key, step_key)
         self.step_key = step_key
 
     def _get_state(self) -> dict[str, Any]:
@@ -101,19 +113,38 @@ class SpatialCache:
             self._step_states[self.step_key] = state
         return state
 
+    @staticmethod
+    def _mask_counts(mask: torch.Tensor) -> dict[str, int]:
+        return {
+            "skip": int((mask == 0).sum().item()),
+            "execute": int((mask == 1).sum().item()),
+            "update": int((mask == 2).sum().item()),
+        }
+
     def clear(self, step_key: Any | None = None) -> None:
         if step_key is None:
             self._step_states.clear()
+            logger.info("spatial cache cleared all step states")
             return
         self._step_states.pop(step_key, None)
+        logger.info("spatial cache cleared step state step_key=%s", step_key)
 
     def preprocess_mask(self, input_mask: torch.Tensor) -> torch.Tensor:
         state = self._get_state()
-        return torch.where(
+        processed = torch.where(
             state["valid"] == 0,
             torch.tensor(2, device=self.device, dtype=torch.int32),
             input_mask,
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "spatial cache preprocess mask step_key=%s counts_in=%s counts_out=%s valid=%s",
+                self.step_key,
+                self._mask_counts(input_mask),
+                self._mask_counts(processed),
+                int(state["valid"].sum().item()),
+            )
+        return processed
 
     def sync_with_output_cache(self, mask: torch.Tensor, masked_prediction: torch.Tensor) -> torch.Tensor:
         state = self._get_state()
@@ -125,6 +156,14 @@ class SpatialCache:
         update_exp = update_mask.unsqueeze(-1)
 
         output_cache = state["output_cache"]
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "spatial cache output sync step_key=%s mask_counts=%s prediction_shape=%s cache_shape=%s",
+                self.step_key,
+                self._mask_counts(mask),
+                tuple(masked_prediction.shape),
+                tuple(output_cache.shape),
+            )
         filled_prediction = torch.where(execute_exp, masked_prediction, output_cache)
         state["output_cache"] = torch.where(update_exp, masked_prediction, output_cache)
         state["valid"] = torch.logical_or(state["valid"], mask == 2)
@@ -157,6 +196,8 @@ class SpatialCache:
 
         if cached_keys is None or cached_keys.shape != masked_keys.shape:
             cached_keys = torch.zeros_like(masked_keys)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("spatial cache kv miss step_key=%s block_type=%s key_id=%s", self.step_key, block_type, key_id)
         if cached_values is None or cached_values.shape != masked_values.shape:
             cached_values = torch.zeros_like(masked_values)
 
@@ -172,6 +213,16 @@ class SpatialCache:
             state["double_block_keys"][key_id] = updated_keys
             state["double_block_values"][key_id] = updated_values
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "spatial cache kv sync step_key=%s block_type=%s key_id=%s mask_counts=%s key_shape=%s value_shape=%s",
+                self.step_key,
+                block_type,
+                key_id,
+                self._mask_counts(mask),
+                tuple(masked_keys.shape),
+                tuple(masked_values.shape),
+            )
         return filled_keys, filled_values
 
 
@@ -228,6 +279,13 @@ def sparse_mlp_compute(
         return mlp_function(input_hidden_states)
 
     seq_mask = mask.squeeze(0)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "sparse mlp compute module=%s input_shape=%s mask_counts=%s",
+            getattr(mlp_function, "__class__", type(mlp_function)).__name__,
+            tuple(input_hidden_states.shape),
+            SpatialCache._mask_counts(mask),
+        )
     if seq_mask.any():
         active_idx = seq_mask.nonzero(as_tuple=False).squeeze(-1)
         mlp_active = input_hidden_states.index_select(1, active_idx)
@@ -276,6 +334,15 @@ def sparse_attention_compute(
 
     hidden_states = torch.zeros_like(query)
     seq_mask = query_mask.squeeze(0)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "sparse attention compute query_shape=%s key_shape=%s value_shape=%s mask_counts=%s backend=%s",
+            tuple(query.shape),
+            tuple(key.shape),
+            tuple(value.shape),
+            SpatialCache._mask_counts(query_mask),
+            backend,
+        )
     if seq_mask.any():
         active_idx = seq_mask.nonzero(as_tuple=False).squeeze(-1)
         query_active = query.index_select(1, active_idx)
@@ -311,9 +378,24 @@ def _temporal_qkv_projections(
     mask: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     if mask is None or getattr(attn, "fused_projections", False):
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "temporal qkv projections using dense path module=%s fused=%s mask_present=%s",
+                attn.__class__.__name__,
+                bool(getattr(attn, "fused_projections", False)),
+                mask is not None,
+            )
         return _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
 
     text_seq_len = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "temporal qkv projections sparse path module=%s hidden_shape=%s text_seq_len=%s mask_counts=%s",
+            attn.__class__.__name__,
+            tuple(hidden_states.shape),
+            text_seq_len,
+            SpatialCache._mask_counts(mask),
+        )
     query = sparse_mlp_compute(attn.to_q, mask[:, text_seq_len:], hidden_states, attn.to_q.out_features)
     key = sparse_mlp_compute(attn.to_k, mask[:, text_seq_len:], hidden_states, attn.to_k.out_features)
     value = sparse_mlp_compute(attn.to_v, mask[:, text_seq_len:], hidden_states, attn.to_v.out_features)
@@ -359,6 +441,14 @@ class TemporalFlux2AttnProcessor(DiffusersFlux2AttnProcessor):
         query, key, value, encoder_query, encoder_key, encoder_value = _temporal_qkv_projections(
             attn, hidden_states, encoder_hidden_states, mask
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "temporal attn processor module=%s kv_mode=%s num_ref_tokens=%s mask_present=%s",
+                attn.__class__.__name__,
+                kv_cache_mode,
+                num_ref_tokens,
+                mask is not None,
+            )
 
         query = query.unflatten(-1, (attn.heads, -1))
         key = key.unflatten(-1, (attn.heads, -1))
@@ -391,12 +481,28 @@ class TemporalFlux2AttnProcessor(DiffusersFlux2AttnProcessor):
             ref_start = num_txt_tokens
             ref_end = num_txt_tokens + num_ref_tokens
             kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "temporal attn kv extract stored module=%s ref_range=[%s,%s) key_shape=%s value_shape=%s",
+                    attn.__class__.__name__,
+                    ref_start,
+                    ref_end,
+                    tuple(key[:, ref_start:ref_end].shape),
+                    tuple(value[:, ref_start:ref_end].shape),
+                )
 
         if kv_cache_mode == "extract" and num_ref_tokens > 0:
             hidden_states = _flux2_kv_causal_attention(
                 query, key, value, num_txt_tokens, num_ref_tokens, backend=self._attention_backend
             )
         elif kv_cache_mode == "cached" and kv_cache is not None:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "temporal attn kv cached lookup module=%s num_txt_tokens=%s num_ref_tokens=%s",
+                    attn.__class__.__name__,
+                    num_txt_tokens,
+                    getattr(kv_cache, "num_ref_tokens", None),
+                )
             hidden_states = _flux2_kv_causal_attention(
                 query, key, value, num_txt_tokens, 0, kv_cache=kv_cache, backend=self._attention_backend
             )
@@ -410,6 +516,12 @@ class TemporalFlux2AttnProcessor(DiffusersFlux2AttnProcessor):
                 parallel_config=self._parallel_config,
                 query_mask=mask,
             )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "temporal attn dense/sparse attention completed module=%s out_shape=%s",
+                    attn.__class__.__name__,
+                    tuple(hidden_states.shape),
+                )
 
         hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
 
@@ -494,6 +606,13 @@ class TemporalFlux2ParallelSelfAttnProcessor(DiffusersFlux2ParallelSelfAttnProce
             if mask is not None
             else attn.to_qkv_mlp_proj(hidden_states)
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "temporal parallel attn module=%s mask_present=%s proj_shape=%s",
+                attn.__class__.__name__,
+                mask is not None,
+                tuple(hidden_states.shape),
+            )
         qkv, mlp_hidden_states = torch.split(
             hidden_states, [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor], dim=-1
         )
@@ -569,12 +688,26 @@ class TemporalFlux2KVParallelSelfAttnProcessor(DiffusersFlux2KVParallelSelfAttnP
             ref_start = num_txt_tokens
             ref_end = num_txt_tokens + num_ref_tokens
             kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "temporal parallel kv extract stored module=%s ref_range=[%s,%s)",
+                    attn.__class__.__name__,
+                    ref_start,
+                    ref_end,
+                )
 
         if kv_cache_mode == "extract" and num_ref_tokens > 0:
             attn_output = _flux2_kv_causal_attention(
                 query, key, value, num_txt_tokens, num_ref_tokens, backend=self._attention_backend
             )
         elif kv_cache_mode == "cached" and kv_cache is not None:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "temporal parallel kv cached lookup module=%s num_txt_tokens=%s num_ref_tokens=%s",
+                    attn.__class__.__name__,
+                    num_txt_tokens,
+                    getattr(kv_cache, "num_ref_tokens", None),
+                )
             attn_output = _flux2_kv_causal_attention(
                 query, key, value, num_txt_tokens, 0, kv_cache=kv_cache, backend=self._attention_backend
             )
