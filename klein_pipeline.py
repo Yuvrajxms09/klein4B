@@ -882,11 +882,13 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             self._cuda_denoiser is not None
             and hidden_states.device.type == "cuda"
         )
+        processed_mask = spatial_cache.preprocess_mask(mask) if spatial_cache is not None and mask is not None else mask
+        denoiser_kwargs = dict(joint_attention_kwargs)
+        if processed_mask is not None:
+            denoiser_kwargs["mask"] = processed_mask
+        if spatial_cache is not None:
+            denoiser_kwargs["spatial_cache"] = spatial_cache
         if use_cuda_denoiser:
-            processed_mask = spatial_cache.preprocess_mask(mask) if spatial_cache is not None and mask is not None else mask
-            denoiser_kwargs = dict(joint_attention_kwargs)
-            if processed_mask is not None:
-                denoiser_kwargs["mask"] = processed_mask
             noise_pred = self._cuda_denoiser(
                 transformer=self.transformer,
                 hidden_states=hidden_states,
@@ -920,13 +922,11 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 encoder_hidden_states=encoder_hidden_states,
                 txt_ids=txt_ids,
                 img_ids=img_ids,
-                joint_attention_kwargs=joint_attention_kwargs,
+                joint_attention_kwargs=denoiser_kwargs,
                 kv_cache=kv_cache,
                 kv_cache_mode=kv_cache_mode,
                 num_ref_tokens=num_ref_tokens,
                 ref_fixed_timestep=ref_fixed_timestep,
-                spatial_cache=spatial_cache,
-                mask=mask,
                 return_dict=False,
             )
         if kv_cache_mode == "extract" and isinstance(output, tuple) and len(output) == 2:
