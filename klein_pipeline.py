@@ -1385,15 +1385,16 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         cache_dit_mod = getattr(self, "_cache_dit_mod", None)
         if cache_dit_mod is not None:
             cache_dit_mod.refresh_context(
-                self.transformer,
+                self._get_transformer_module(),
                 num_inference_steps=num_inference_steps,
                 verbose=False,
             )
 
-        if latents.dtype != self.transformer.dtype:
-            latents = latents.to(self.transformer.dtype)
-        if image_latents is not None and image_latents.dtype != self.transformer.dtype:
-            image_latents = image_latents.to(self.transformer.dtype)
+        transformer_dtype = self._get_transformer_module().dtype
+        if latents.dtype != transformer_dtype:
+            latents = latents.to(transformer_dtype)
+        if image_latents is not None and image_latents.dtype != transformer_dtype:
+            image_latents = image_latents.to(transformer_dtype)
 
         # 7. Denoising loop
         # We set the index here to remove DtoH sync, helpful especially during compilation.
