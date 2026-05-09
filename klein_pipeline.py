@@ -222,6 +222,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         )
 
         self.register_to_config(is_distilled=is_distilled)
+        self._transformer_module = transformer
+        self._transformer_config = transformer.config
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         # Flux latents are turned into 2x2 patches and packed. This means the latent width and height has to be divisible
@@ -253,8 +255,27 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._cuda_denoiser: Callable[..., torch.Tensor] | None = None
         self._cuda_denoiser_name: str | None = None
         self._klein_c_full_backend: Any | None = None
-        self._temporal_state_signature: tuple[Any, ...] | None = None
         self._reference_kv_cache: Flux2KVCache | None = None
+
+    def _get_transformer_module(self) -> Any:
+        transformer = getattr(self.transformer, "_orig_mod", None)
+        if transformer is not None:
+            return transformer
+        transformer = getattr(self, "_transformer_module", None)
+        if transformer is not None:
+            return transformer
+        return self.transformer
+
+    def _get_transformer_config(self) -> Any:
+        config = getattr(self, "_transformer_config", None)
+        if config is not None:
+            return config
+        transformer = self._get_transformer_module()
+        config = getattr(transformer, "config", None)
+        if config is None:
+            raise AttributeError("Transformer config is unavailable")
+        self._transformer_config = config
+        return config
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -681,7 +702,6 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         logger.info("inference caches cleared including temporal state")
 
     def _clear_temporal_caches(self) -> None:
-        self._temporal_state_signature = None
         self._reference_kv_cache = None
         spatial_cache = getattr(self, "_temporal_spatial_cache", None)
         if spatial_cache is not None:
@@ -707,26 +727,6 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             tensor = value.detach()
             return ("tensor", tuple(tensor.shape), str(tensor.dtype), str(tensor.device), int(tensor.data_ptr()))
         return ("obj", type(value).__name__, id(value))
-
-    def _build_temporal_state_signature(
-        self,
-        *,
-        prompt: str | list[str] | None,
-        prompt_embeds: torch.Tensor | None,
-        negative_prompt_embeds: torch.Tensor | str | list[str] | None,
-        image: Any,
-        attention_kwargs: dict[str, Any] | None,
-    ) -> tuple[Any, ...]:
-        attention_kwargs = attention_kwargs or {}
-        return (
-            self._fingerprint_value(prompt),
-            self._fingerprint_value(prompt_embeds),
-            self._fingerprint_value(negative_prompt_embeds),
-            self._fingerprint_value(image),
-            self._fingerprint_value(attention_kwargs.get("reference_kv_cache_mode")),
-            self._fingerprint_value(attention_kwargs.get("reference_num_tokens")),
-            self._fingerprint_value(attention_kwargs.get("reference_fixed_timestep")),
-        )
 
     def enable_compile(
         self,
@@ -760,6 +760,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
         if compile_transformer:
             try:
+                self._transformer_module = self._get_transformer_module()
+                self._transformer_config = getattr(self._transformer_module, "config", self._transformer_config)
                 self.transformer = torch.compile(self.transformer, **base_compile_kwargs)
                 logger.info("transformer compiled: %s", base_compile_kwargs)
             except Exception as exc:
@@ -850,8 +852,6 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 step_key = int(timestep)
             spatial_cache.set_step_key(step_key)
             logger.debug("spatial cache step key set step_key=%s context=%s", step_key, context)
-        if spatial_cache is not None and mask is not None:
-            joint_attention_kwargs["mask"] = spatial_cache.preprocess_mask(mask)
 
         if kv_cache_mode == "cached" and kv_cache is None:
             kv_cache = self._reference_kv_cache
@@ -883,6 +883,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             and hidden_states.device.type == "cuda"
         )
         if use_cuda_denoiser:
+            processed_mask = spatial_cache.preprocess_mask(mask) if spatial_cache is not None and mask is not None else mask
+            denoiser_kwargs = dict(joint_attention_kwargs)
+            if processed_mask is not None:
+                denoiser_kwargs["mask"] = processed_mask
             noise_pred = self._cuda_denoiser(
                 transformer=self.transformer,
                 hidden_states=hidden_states,
@@ -890,15 +894,15 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 encoder_hidden_states=encoder_hidden_states,
                 txt_ids=txt_ids,
                 img_ids=img_ids,
-                joint_attention_kwargs=joint_attention_kwargs,
+                joint_attention_kwargs=denoiser_kwargs,
                 context=context,
             )
             if not isinstance(noise_pred, torch.Tensor):
                 raise TypeError(
                     f"CUDA denoiser '{self._cuda_denoiser_name}' must return torch.Tensor, got {type(noise_pred)}",
                 )
-            if spatial_cache is not None and mask is not None:
-                noise_pred = spatial_cache.sync_with_output_cache(joint_attention_kwargs["mask"], noise_pred)
+            if spatial_cache is not None and processed_mask is not None:
+                noise_pred = spatial_cache.sync_with_output_cache(processed_mask, noise_pred)
             logger.debug(
                 "cuda denoiser output shape=%s context=%s kv_mode=%s",
                 tuple(noise_pred.shape),
@@ -907,7 +911,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             )
             return noise_pred
 
-        with self.transformer.cache_context(context):
+        transformer = self._get_transformer_module()
+        with transformer.cache_context(context):
             output = self.transformer(
                 hidden_states=hidden_states,  # (B, image_seq_len, C)
                 timestep=timestep / 1000,
@@ -921,7 +926,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 num_ref_tokens=num_ref_tokens,
                 ref_fixed_timestep=ref_fixed_timestep,
                 spatial_cache=spatial_cache,
-                mask=joint_attention_kwargs.get("mask"),
+                mask=mask,
                 return_dict=False,
             )
         if kv_cache_mode == "extract" and isinstance(output, tuple) and len(output) == 2:
@@ -1218,24 +1223,6 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._current_timestep = None
         self._interrupt = False
 
-        temporal_signature = self._build_temporal_state_signature(
-            prompt=prompt,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            image=image,
-            attention_kwargs=attention_kwargs,
-        )
-        if self._temporal_state_signature is not None and temporal_signature != self._temporal_state_signature:
-            logger.info(
-                "temporal state changed, clearing caches old_signature=%s new_signature=%s",
-                self._temporal_state_signature,
-                temporal_signature,
-            )
-            self.clear_inference_caches()
-        elif self._temporal_state_signature is None:
-            logger.debug("temporal state initialized signature=%s", temporal_signature)
-        self._temporal_state_signature = temporal_signature
-
         profile_inference = _resolve_inference_profile_flag(profile)
         text_encoder_s = vae_encode_s = transformer_s = vae_decode_s = 0.0
 
@@ -1354,7 +1341,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         width = width or self.default_sample_size * self.vae_scale_factor
 
         # 5. prepare latent variables
-        num_channels_latents = self.transformer.config.in_channels // 4
+        num_channels_latents = self._get_transformer_config().in_channels // 4
         latents, latent_ids = self.prepare_latents(
             batch_size=batch_size * num_images_per_prompt,
             num_latents_channels=num_channels_latents,

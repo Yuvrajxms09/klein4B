@@ -49,6 +49,18 @@ except Exception:  # pragma: no cover - optional dependency in some envs
 logger = logging.getLogger(__name__)
 
 
+def _get_transformer_config(pipe: Any) -> Any:
+    config = getattr(pipe, "_transformer_config", None)
+    if config is not None:
+        return config
+    transformer = getattr(pipe, "transformer", None)
+    if transformer is not None:
+        config = getattr(transformer, "config", None)
+        if config is not None:
+            return config
+    raise AttributeError("pipe transformer config is unavailable")
+
+
 def latent_token_count_for_resolution(pipe: Any, height: int, width: int) -> int:
     """
     Compute packed latent token length (H*W in packed latent space) used by the denoiser.
@@ -1423,7 +1435,7 @@ class NunchakuKleinFullBackend:
             raise RuntimeError("pipe is required for latent preprocessing")
         return self.pipe.prepare_latents(
             batch_size=1,
-            num_latents_channels=self.pipe.transformer.config.in_channels // 4,
+            num_latents_channels=_get_transformer_config(self.pipe).in_channels // 4,
             height=image.shape[-2],
             width=image.shape[-1],
             dtype=dtype,
@@ -1459,7 +1471,7 @@ class NunchakuKleinFullBackend:
         )
         latents, latent_ids = pipe.prepare_latents(
             batch_size=1,
-            num_latents_channels=pipe.transformer.config.in_channels // 4,
+            num_latents_channels=_get_transformer_config(pipe).in_channels // 4,
             height=config.height,
             width=config.width,
             dtype=prompt_embeds.dtype,

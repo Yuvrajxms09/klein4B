@@ -231,8 +231,6 @@ class TemporalConsistencyController:
         ref_mask = self.use_reference_image_mask()
         if ref_mask is not None:
             mask = torch.cat([mask, ref_mask], dim=-1)
-        if spatial_cache is not None:
-            mask = spatial_cache.preprocess_mask(mask)
         kwargs: dict[str, Any] = {"mask": mask}
         if spatial_cache is not None:
             kwargs["spatial_cache"] = spatial_cache
