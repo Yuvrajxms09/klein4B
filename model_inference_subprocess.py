@@ -66,14 +66,15 @@ class ModelInferenceSubprocess:
         }
 
     def load_models(self):
+        local_files_only = self.config.get("local_files_only", False)
         self.set_status(
             "loading_models",
-            f"loading pipe from {self.config['model_dir']} (compile={self.config.get('compile_models', False)}, dynamic={self.config.get('compile_dynamic', False)}, interpolate={self.config.get('interpolate', False)})",
+            f"loading pipe from {self.config['model_dir']} (local_files_only={local_files_only}, compile={self.config.get('compile_models', False)}, dynamic={self.config.get('compile_dynamic', False)}, interpolate={self.config.get('interpolate', False)})",
         )
         self.pipe = Flux2KleinPipeline.from_pretrained(
             self.config["model_dir"],
             torch_dtype=torch.bfloat16,
-            local_files_only=True,
+            local_files_only=local_files_only,
         ).to("cuda")
         self.pipe.set_progress_bar_config(disable=True)
 
@@ -116,7 +117,6 @@ class ModelInferenceSubprocess:
             .clamp(0, 1)
             .mul(255)
             .to(torch.uint8)
-            .permute(1, 2, 0)
             .cpu()
             .numpy()
         )
@@ -295,8 +295,17 @@ class ModelInferenceSubprocess:
             frames_out = frames[1:]
 
         frames_cpu = self._tensor_to_numpy(frames_out)
+        if frames_cpu.ndim == 4 and frames_cpu.shape[1] == 3:
+            frames_cpu = np.transpose(frames_cpu, (0, 2, 3, 1))
+        elif frames_cpu.ndim == 3 and frames_cpu.shape[0] == 3:
+            frames_cpu = np.transpose(frames_cpu, (1, 2, 0))
+            frames_cpu = frames_cpu[None, ...]
+        else:
+            raise RuntimeError(
+                f"Unexpected interpolated frame shape {frames_cpu.shape}; expected (B, 3, H, W) or (3, H, W)"
+            )
         self.previous_frame = frame
-        return frames_cpu[..., ::-1]
+        return frames_cpu[..., ::-1].copy()
 
     def send_frames(self, frames):
         self.output_batch_shared_tensor.copy_from(frames)
