@@ -901,6 +901,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         else:
             processed_mask = mask
         denoiser_kwargs = dict(joint_attention_kwargs)
+        # Pipeline-only control handle: keep it on the pipeline for cache resets,
+        # but do not forward it into attention processors.
+        denoiser_kwargs.pop("temporal_controller", None)
         if processed_mask is not None:
             denoiser_kwargs["mask"] = processed_mask
         if spatial_cache is not None:

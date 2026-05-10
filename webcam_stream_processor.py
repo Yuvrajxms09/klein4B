@@ -23,6 +23,7 @@ def _build_config(args: argparse.Namespace) -> dict:
         "default_steps": args.steps,
         "default_seed": args.seed,
         "compile_models": not args.no_compile,
+        "compile_dynamic": False,
         "interpolation_exp": interpolation_exp,
         "interpolate": args.interpolate,
         "rife_weights_path": args.rife_weights,
@@ -31,6 +32,7 @@ def _build_config(args: argparse.Namespace) -> dict:
         "mask_calculation_method": "auto",
         "always_update_image_cache": True,
         "logging": True,
+        "headless": args.headless,
     }
 
 
@@ -86,35 +88,40 @@ def serve(args: argparse.Namespace) -> None:
     )
     capture_thread.start()
 
+    headless = bool(args.headless)
     window_name = "klein4B webcam stream"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, args.width, args.height)
+    if not headless:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, args.width, args.height)
 
     try:
         while not processor.is_ready():
             frame = np.zeros((args.height, args.width, 3), dtype=np.uint8)
-            cv2.imshow(window_name, frame)
-            cv2.waitKey(1)
+            if not headless:
+                cv2.imshow(window_name, frame)
+                cv2.waitKey(1)
             time.sleep(0.01)
         while True:
             frame = processor.get_output_tensor().to_numpy()
             if frame.shape[:2] != (args.height, args.width):
                 frame = np.zeros((args.height, args.width, 3), dtype=np.uint8)
-            cv2.imshow(window_name, frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            if key == ord("r"):
-                processor.set_param("prompt", args.prompt)
-            if key == ord("1"):
-                processor.set_steps(args.steps)
+            if not headless:
+                cv2.imshow(window_name, frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if key == ord("r"):
+                    processor.set_param("prompt", args.prompt)
+                if key == ord("1"):
+                    processor.set_steps(args.steps)
             time.sleep(0.001)
     except KeyboardInterrupt:
         pass
     finally:
         stop_event.set()
         processor.stop()
-        cv2.destroyAllWindows()
+        if not headless:
+            cv2.destroyAllWindows()
 
 
 def parse_args() -> argparse.Namespace:
@@ -133,6 +140,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-fps", type=float, default=30.0)
     parser.add_argument("--interpolate", action="store_true")
     parser.add_argument("--interpolation-exp", type=int, default=1)
+    parser.add_argument("--headless", action="store_true", help="Disable the OpenCV display window")
     parser.add_argument(
         "--rife-weights",
         default=str(_repo_root().parent / "RIFE-safetensors" / "flownet.safetensors"),

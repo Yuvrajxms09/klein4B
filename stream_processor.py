@@ -1,12 +1,15 @@
 import json
 import multiprocessing
 from multiprocessing import Value
+import logging
 
 import numpy as np
 
 from output_scheduler_subprocess import OutputSchedulerSubprocess
 from model_inference_subprocess import ModelInferenceSubprocess
 from utils.shared_tensor import SharedTensor
+
+logger = logging.getLogger(__name__)
 
 
 class StreamProcessor:
@@ -57,6 +60,14 @@ class StreamProcessor:
             return json.load(file)
 
     def start(self) -> None:
+        if self.config.get("logging", True):
+            logger.info(
+                "Starting stream processor (resolution=%sx%s, interpolation_exp=%s, interpolate=%s)",
+                self.resolution["width"],
+                self.resolution["height"],
+                self.config.get("interpolation_exp", 1),
+                self.config.get("interpolate", False),
+            )
         self.model_inference_subprocess.start()
         self.output_scheduler_subprocess.start()
 
@@ -67,6 +78,8 @@ class StreamProcessor:
         return self.output_shared_tensor
 
     def stop(self) -> None:
+        if self.config.get("logging", True):
+            logger.info("Stopping stream processor")
         self.model_inference_subprocess.stop()
         self.output_scheduler_subprocess.stop()
         self.input_shared_tensor.close_and_unlink()
@@ -104,6 +117,16 @@ class StreamProcessor:
 
     def is_ready(self) -> bool:
         return bool(self.frame_written.value)
+
+    def model_worker_alive(self) -> bool:
+        process = self.model_inference_subprocess.process
+        return bool(process and process.is_alive())
+
+    def model_worker_error(self) -> dict:
+        return self.model_inference_subprocess.get_error()
+
+    def model_worker_status(self) -> dict:
+        return dict(self.model_inference_subprocess.shared_state)
 
     def get_input_shared_tensor_name(self) -> str:
         return self.input_shared_tensor.name

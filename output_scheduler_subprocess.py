@@ -1,7 +1,10 @@
 from multiprocessing import Process, Value
+import logging
 import time
 
 from utils.shared_tensor import SharedTensor
+
+logger = logging.getLogger(__name__)
 
 
 class OutputSchedulerSubprocess:
@@ -31,6 +34,8 @@ class OutputSchedulerSubprocess:
         self.running.value = True
         self.process = Process(target=self.process_main)
         self.process.start()
+        if self.config.get("logging", True):
+            logger.info("Output scheduler process started pid=%s", self.process.pid)
 
     def stop(self) -> None:
         self.running.value = False
@@ -52,6 +57,7 @@ class OutputSchedulerSubprocess:
 
     def process_main(self) -> None:
         self.process_init()
+        first_frame_logged = False
 
         while self.running.value:
             if not self.pack_is_ready.value:
@@ -59,6 +65,13 @@ class OutputSchedulerSubprocess:
 
             proc_time = min(max(self.last_processing_time.value, 0.001), 1.0)
             sleep_interval = proc_time / self.batch_size
+            if self.config.get("logging", True):
+                logger.info(
+                    "Output scheduler consuming batch (batch_size=%s, proc_time=%.4fs, sleep_interval=%.4fs)",
+                    self.batch_size,
+                    proc_time,
+                    sleep_interval,
+                )
 
             for i in range(self.batch_size):
                 self.output_shared_tensor.copy_from(
@@ -66,6 +79,13 @@ class OutputSchedulerSubprocess:
                 )
                 if self.frame_written is not None and not self.frame_written.value:
                     self.frame_written.value = True
+                if not first_frame_logged:
+                    logger.info(
+                        "Output scheduler published first frame (batch_size=%s, proc_time=%.4fs)",
+                        self.batch_size,
+                        proc_time,
+                    )
+                    first_frame_logged = True
                 if i < self.batch_size - 1:
                     time.sleep(sleep_interval)
 

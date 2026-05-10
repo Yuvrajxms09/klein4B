@@ -3,7 +3,9 @@ from __future__ import annotations
 from copy import deepcopy
 from multiprocessing import Manager, Process, Value
 from queue import Empty
+import logging
 import time
+import traceback
 
 import numpy as np
 import torch
@@ -14,6 +16,8 @@ from interpolation import expand_batch_with_rife, load_rife_ifnet
 from klein_pipeline import Flux2KleinPipeline
 from temporal_consistency import TemporalConsistencyConfig, TemporalConsistencyController
 from utils.shared_tensor import SharedTensor
+
+logger = logging.getLogger(__name__)
 
 
 class ModelInferenceSubprocess:
@@ -41,7 +45,17 @@ class ModelInferenceSubprocess:
         manager = Manager()
         self.command_queue = manager.Queue()
         self.shared_state = manager.dict()
+        self.worker_error = manager.dict(message=None, traceback=None)
         self.interpolation_exp = self.config.get("interpolation_exp", 1)
+
+    def set_status(self, phase: str, message: str | None = None) -> None:
+        self.shared_state["phase"] = phase
+        if message is not None:
+            self.shared_state["message"] = message
+            if self.logging:
+                logger.info("[%s] %s", phase, message)
+        elif self.logging:
+            logger.info("[%s]", phase)
 
     def init_process_state(self):
         self.device = "cuda"
@@ -52,6 +66,10 @@ class ModelInferenceSubprocess:
         }
 
     def load_models(self):
+        self.set_status(
+            "loading_models",
+            f"loading pipe from {self.config['model_dir']} (compile={self.config.get('compile_models', False)}, dynamic={self.config.get('compile_dynamic', False)}, interpolate={self.config.get('interpolate', False)})",
+        )
         self.pipe = Flux2KleinPipeline.from_pretrained(
             self.config["model_dir"],
             torch_dtype=torch.bfloat16,
@@ -68,10 +86,11 @@ class ModelInferenceSubprocess:
         )
 
         if self.config.get("compile_models", False):
-            self.pipe.enable_compile(dynamic=True)
+            self.pipe.enable_compile(dynamic=self.config.get("compile_dynamic", False))
 
         self.rife_model = None
         if self.config.get("interpolate", False) and self.interpolation_exp > 0:
+            self.set_status("loading_rife", f"loading RIFE weights from {self.config['rife_weights_path']}")
             self.rife_model = load_rife_ifnet(
                 self.config["rife_weights_path"],
                 device="cuda",
@@ -127,9 +146,11 @@ class ModelInferenceSubprocess:
         )
 
     def process_init(self):
+        self.set_status("starting", "initializing shared tensors and models")
         self.init_process_state()
         self.init_shared_tensors()
         self.load_models()
+        self.set_status("encoding_prompt", f"encoding prompt {self.process_state['prompt']!r}")
         self.update_prompt_embeds(self.process_state["prompt"])
         self.previous_frame = None
 
@@ -158,11 +179,19 @@ class ModelInferenceSubprocess:
         if target_fps is not None:
             target_base_fps = target_fps / (2**self.interpolation_exp)
             self.target_base_processing_time = 1 / target_base_fps
+        self.set_status(
+            "ready",
+            f"ready at {self.width}x{self.height}, steps={self.process_state['steps']}, target_fps={target_fps}",
+        )
 
     def start(self):
         self.running.value = True
         self.process = Process(target=self.process_main)
         self.process.start()
+        self.shared_state["pid"] = self.process.pid
+        self.shared_state["alive"] = True
+        if self.logging:
+            logger.info("Model worker process started pid=%s", self.process.pid)
 
     def stop(self):
         self.running.value = False
@@ -328,13 +357,36 @@ class ModelInferenceSubprocess:
         return frame
 
     def process_main(self):
-        self.process_init()
-        prev_time = time.time()
-        while self.running.value:
-            self.update_process_state()
-            frame = self.input_shared_tensor.to_numpy()
-            frame = frame[..., ::-1].copy()
-            frame = self.process_frame_with_pipeline(frame)
-            frame = self.convert_np_to_torch(frame)
-            frames = self.interpolate_frames(frame)
-            prev_time = self.sync_fps_and_send(prev_time, frames)
+        try:
+            self.process_init()
+            prev_time = time.time()
+            self.set_status("running", "entering inference loop")
+            while self.running.value:
+                self.update_process_state()
+                frame = self.input_shared_tensor.to_numpy()
+                frame = frame[..., ::-1].copy()
+                self.set_status("infer", "running pipeline on next webcam frame")
+                frame = self.process_frame_with_pipeline(frame)
+                frame = self.convert_np_to_torch(frame)
+                frames = self.interpolate_frames(frame)
+                self.set_status("publish", f"publishing batch of {frames.shape[0]} frame(s)")
+                prev_time = self.sync_fps_and_send(prev_time, frames)
+        except Exception as exc:
+            logger.exception("Model worker failed")
+            self.worker_error["message"] = repr(exc)
+            self.worker_error["traceback"] = traceback.format_exc()
+            self.shared_state["alive"] = False
+            self.shared_state["phase"] = "error"
+            self.shared_state["message"] = repr(exc)
+            self.running.value = False
+            self.pack_is_ready.value = False
+            raise
+
+    def has_error(self) -> bool:
+        return self.worker_error.get("message") is not None
+
+    def get_error(self) -> dict:
+        return {
+            "message": self.worker_error.get("message"),
+            "traceback": self.worker_error.get("traceback"),
+        }
