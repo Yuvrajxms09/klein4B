@@ -16,5 +16,7 @@ We tried a lighter VAE (TAEF2) for faster encode/decode; it reduced output quali
 - **`klein_pipeline.py`** – Loads and run T2I/I2I.
 - **`cache_dit_klein.py`** – `enable_cache_dit(pipe)` and `apply_attention_backend(pipe, "sage")` (or `"auto"` / `"native"`). Call after loading the pipeline.
 - **Temporal loop** – Repeated `pipe(...)` calls with the same prompt will now refine the previous output by default. Use `feedback_strength=0` to disable it or `clear_temporal_state()` to reset it.
+- **Direct editor bridge** – [`editor_runtime.py`](/Users/yuvraj/Desktop/multi-angle/klein4B/editor_runtime.py) exposes `FluxRTEditorRuntime` for non-Gradio editor integration: push canvas frames, prompt, and masks directly into `StreamProcessor`, then poll the latest output frame.
+- **Editor loop helper** – [`editor_loop.py`](/Users/yuvraj/Desktop/multi-angle/klein4B/editor_loop.py) adds `FluxRTEditorLoop.step(...)` for app render loops that want to dedupe repeated canvas/mask/prompt updates before forwarding them to FluxRT.
 
 Enable compile after setup: `pipe.enable_compile(dynamic=True)`.

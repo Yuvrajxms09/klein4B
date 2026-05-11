@@ -1,0 +1,16 @@
+{
+    "default_prompt" : "Turn this into art.",
+    "default_steps" : 2,
+    "default_seed" : 52,
+    "models_path" : "FLUX.2-klein-4B",
+    "resolution" : {
+        "height" : 320,
+        "width" : 576
+    },
+    "compile_models": true,
+    "enable_spatial_cache": true,
+    "target_fps":null,
+    "interpolation_exp": 2,
+    "use_reference_image": false,
+    "logging": false
+}
