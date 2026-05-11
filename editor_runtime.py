@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from fluxrt import StreamProcessor
-from fluxrt.utils import crop_maximal_rectangle
+from fluxrt.utils.crop_maximal_rectangle import crop_maximal_rectangle
 
 
 ColorSpace = Literal["rgb", "bgr"]
