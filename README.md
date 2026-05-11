@@ -18,5 +18,6 @@ We tried a lighter VAE (TAEF2) for faster encode/decode; it reduced output quali
 - **Temporal loop** – Repeated `pipe(...)` calls with the same prompt will now refine the previous output by default. Use `feedback_strength=0` to disable it or `clear_temporal_state()` to reset it.
 - **Direct editor bridge** – [`editor_runtime.py`](/Users/yuvraj/Desktop/multi-angle/klein4B/editor_runtime.py) exposes `FluxRTEditorRuntime` for non-Gradio editor integration: push canvas frames, prompt, and masks directly into `StreamProcessor`, then poll the latest output frame.
 - **Editor loop helper** – [`editor_loop.py`](/Users/yuvraj/Desktop/multi-angle/klein4B/editor_loop.py) adds `FluxRTEditorLoop.step(...)` for app render loops that want to dedupe repeated canvas/mask/prompt updates before forwarding them to FluxRT.
+- **Colab helper** – [`colab_runtime.py`](/Users/yuvraj/Desktop/multi-angle/klein4B/colab_runtime.py) adds `start_colab_runtime(...)`, `update_editor_state(...)`, `show_latest_frame(...)`, and `display_live_preview(...)` for persistent notebook sessions.
 
 Enable compile after setup: `pipe.enable_compile(dynamic=True)`.
