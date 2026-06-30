@@ -17,5 +17,7 @@
         "height" : 256,
         "width" : 256
     },
-    "logging": true
+    "logging": true,
+    "debug_tracing": false,
+    "debug_trace_every_n": 30
 }

@@ -21,6 +21,8 @@ class EditorState:
     canvas_colorspace: ColorSpace = "rgb"
     reference_colorspace: ColorSpace = "rgb"
     full_resolution_mask: bool = True
+    clear_mask: bool = False
+    clear_reference_image: bool = False
 
 
 class FluxRTEditorLoop:
@@ -73,10 +75,18 @@ class FluxRTEditorLoop:
             )
             self._last_mask_key = mask_key
             changed = True
+        elif state.clear_mask:
+            self.runtime.clear_mask()
+            self._last_mask_key = None
+            changed = True
 
         reference_hash = self._hash_array(state.reference_image)
         reference_key = (reference_hash, state.reference_colorspace)
-        if (
+        if state.clear_reference_image:
+            self.runtime.clear_reference_image()
+            self._last_reference_key = None
+            changed = True
+        elif (
             state.reference_image is not None
             and reference_key != self._last_reference_key
         ):

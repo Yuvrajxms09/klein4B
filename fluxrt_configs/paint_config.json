@@ -13,6 +13,8 @@
     "interpolation_exp": 2,
     "use_reference_image": false,
     "logging": false,
+    "debug_tracing": false,
+    "debug_trace_every_n": 30,
     "always_update_image_cache": false,
     "mask_calculation_method": "manual"
 }

@@ -16,15 +16,21 @@ class StreamProcessor:
         self.config = self.parse_config(config_path)
         self.resolution = self.config["resolution"]
         output_batch_size = 2 ** self.config["interpolation_exp"]
+        out_height = self.resolution["height"]
+        out_width = self.resolution["width"]
+        if self.config.get("enable_flow_upscaler", False):
+            out_height *= 2
+            out_width *= 2
+        self.out_resolution = {"height": out_height, "width": out_width}
 
         self.input_shared_tensor = SharedTensor(
             (self.resolution["height"], self.resolution["width"], 3), create=True
         )
         self.output_shared_tensor = SharedTensor(
-            (self.resolution["height"], self.resolution["width"], 3), create=True
+            (out_height, out_width, 3), create=True
         )
         self.output_batch_shared_tensor = SharedTensor(
-            (output_batch_size, self.resolution["height"], self.resolution["width"], 3),
+            (output_batch_size, out_height, out_width, 3),
             create=True,
         )
 
@@ -84,6 +90,9 @@ class StreamProcessor:
     def set_param(self, name: str, value) -> None:
         self.model_inference_subprocess.set_param(name=name, value=value)
 
+    def enable_quantization(self) -> None:
+        self.model_inference_subprocess.enable_quantization()
+
     def set_reference_image(self, image: np.ndarray | None) -> None:
         if not self.config.get("use_reference_image", False):
             raise ValueError(
@@ -101,6 +110,9 @@ class StreamProcessor:
     def get_resolution(self) -> dict:
         return self.resolution
 
+    def get_out_resolution(self) -> dict:
+        return self.out_resolution
+
     def is_ready(self) -> bool:
         return bool(self.frame_written.value)
 
@@ -113,3 +125,7 @@ class StreamProcessor:
     def get_last_processing_time(self) -> float:
         with self.last_processing_time.get_lock():
             return self.last_processing_time.value
+
+    def get_reserved_memory(self) -> int:
+        """Returns reserved GPU memory in MB."""
+        return self.model_inference_subprocess.memory_reserved.value

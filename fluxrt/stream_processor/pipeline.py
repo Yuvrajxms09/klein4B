@@ -32,6 +32,7 @@ from diffusers.pipelines.flux2.pipeline_output import Flux2PipelineOutput
 from fluxrt.stream_processor.transformer_flux2 import Flux2Transformer2DModel
 from fluxrt.stream_processor.transformer_flux2 import SpatialCache
 from fluxrt.stream_processor.update_controller import UpdateController
+from fluxrt.flow_upscaler.flow_upscaler_pipeline import FlowUpscalerPipeline
 
 import time
 
@@ -183,7 +184,14 @@ def retrieve_latents(
     if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
         return encoder_output.latent_dist.sample(generator)
     elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
-        return encoder_output.latent_dist.mode()
+        latent_dist = encoder_output.latent_dist
+        mode = getattr(latent_dist, "mode", None)
+        if mode is not None:
+            return mode() if callable(mode) else mode
+        mean = getattr(latent_dist, "mean", None)
+        if mean is not None:
+            return mean() if callable(mean) else mean
+        return latent_dist.sample(generator)
     elif hasattr(encoder_output, "latents"):
         return encoder_output.latents
     else:
@@ -224,6 +232,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         is_distilled: bool = False,
         update_controller: UpdateController = None,
         subprocess_config=None,
+        upscaler_pipeline: FlowUpscalerPipeline | None = None,
     ):
         super().__init__()
 
@@ -237,11 +246,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
         self.register_to_config(is_distilled=is_distilled)
 
-        self.vae_scale_factor = (
-            2 ** (len(self.vae.config.block_out_channels) - 1)
-            if getattr(self, "vae", None) is not None
-            else 8
-        )
+        self.vae_scale_factor = 8
         # Flux latents are turned into 2x2 patches and packed. This means the latent width and height has to be divisible
         # by the patch size. So the vae scale factor is multiplied by the patch size to account for this
         self.image_processor = Flux2ImageProcessor(
@@ -256,6 +261,32 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
         self._progress_bar_config = {"disable": True}
         self.subprocess_config = subprocess_config
+        self.upscaler_pipeline = upscaler_pipeline
+        self._debug_tracing = bool((subprocess_config or {}).get("debug_tracing", False))
+        self._debug_trace_every_n = max(
+            1, int((subprocess_config or {}).get("debug_trace_every_n", 1))
+        )
+        self._debug_call_counter = 0
+
+    def _trace(self, message: str) -> None:
+        if self._debug_tracing:
+            print(f"[FluxRTDebug][pipeline] {message}")
+
+    @staticmethod
+    def _summarize_mask(mask: torch.Tensor) -> dict[str, int | float]:
+        zero = int((mask == 0).sum().item())
+        execute_only = int((mask == 1).sum().item())
+        execute_update = int((mask == 2).sum().item())
+        total = int(mask.numel())
+        active = execute_only + execute_update
+        return {
+            "total": total,
+            "active": active,
+            "execute_only": execute_only,
+            "execute_update": execute_update,
+            "zero": zero,
+            "active_pct": (active / total * 100.0) if total else 0.0,
+        }
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -812,6 +843,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._attention_kwargs = attention_kwargs
         self._current_timestep = None
         self._interrupt = False
+        self._debug_call_counter += 1
+        debug_this_call = self._debug_tracing and (
+            self._debug_call_counter % self._debug_trace_every_n == 0
+        )
         profile("1")
 
         # 2. Define call parameters
@@ -874,6 +909,12 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 condition_images.append(img)
                 height = height or image_height
                 width = width or image_width
+        if debug_this_call:
+            self._trace(
+                f"call={self._debug_call_counter} "
+                f"batch={batch_size} steps={num_inference_steps} guidance={guidance_scale} "
+                f"height={height} width={width} refs={0 if condition_images is None else len(condition_images)}"
+            )
 
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
@@ -902,6 +943,13 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 generator=generator,
                 device=device,
                 dtype=self.vae.dtype,
+            )
+        if debug_this_call:
+            self._trace(
+                f"call={self._debug_call_counter} "
+                f"latents={tuple(latents.shape)} latent_ids={tuple(latent_ids.shape)} "
+                f"image_latents={None if image_latents is None else tuple(image_latents.shape)} "
+                f"image_latent_ids={None if image_latent_ids is None else tuple(image_latent_ids.shape)}"
             )
 
         profile("5")
@@ -966,6 +1014,13 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 print(
                     f"recomputing {(mask.float().sum() / mask.shape[1] * 100):.2f}% of tokens"
                 )
+            if debug_this_call:
+                summary = self._summarize_mask(mask)
+                self._trace(
+                    f"call={self._debug_call_counter} mask total={summary['total']} "
+                    f"active={summary['active']} active_pct={summary['active_pct']:.2f} "
+                    f"execute_only={summary['execute_only']} execute_update={summary['execute_update']}"
+                )
 
         # We set the index here to remove DtoH sync, helpful especially during compilation.
         # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
@@ -987,6 +1042,12 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                         self.transformer.dtype
                     )
                     latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
+                if debug_this_call and i == 0:
+                    self._trace(
+                        f"call={self._debug_call_counter} step={i} "
+                        f"latent_model_input={tuple(latent_model_input.shape)} "
+                        f"latent_image_ids={tuple(latent_image_ids.shape)}"
+                    )
 
                 with self.transformer.cache_context("cond"):
                     profile("reset")
@@ -1000,6 +1061,12 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                                 output_channels=128,
                             )
                         spatial_cache = self.spatial_cache[timestep_key]
+                    if debug_this_call and i == 0:
+                        self._trace(
+                            f"call={self._debug_call_counter} step={i} "
+                            f"spatial_cache={'on' if spatial_cache is not None else 'off'} "
+                            f"cached_timesteps={len(self.spatial_cache)}"
+                        )
 
                     noise_pred = self.transformer(
                         hidden_states=latent_model_input,  # (B, image_seq_len, C)
@@ -1075,6 +1142,13 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         latents_bn_std = torch.sqrt(
             self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps
         ).to(latents.device, latents.dtype)
+
+        if self.upscaler_pipeline is not None:
+            latents = self._unpatchify_latents(latents)
+            latents = self.upscaler_pipeline(latents, generator=generator)
+            latents = self._patchify_latents(latents)
+            profile("upscale")
+
         latents = latents * latents_bn_std + latents_bn_mean
         latents = self._unpatchify_latents(latents)
 
@@ -1084,6 +1158,19 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         else:
             image = self.vae.decode(latents, return_dict=False)[0]
             image = self.image_processor.postprocess(image, output_type=output_type)
+        if debug_this_call:
+            if output_type == "latent":
+                output_desc = tuple(image.shape)
+            elif isinstance(image, np.ndarray):
+                output_desc = tuple(image.shape)
+            elif isinstance(image, list):
+                output_desc = f"list[{len(image)}]"
+            else:
+                output_desc = type(image).__name__
+            self._trace(
+                f"call={self._debug_call_counter} output_type={output_type} "
+                f"output={output_desc}"
+            )
 
         profile("decode")
 

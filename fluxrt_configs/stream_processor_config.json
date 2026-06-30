@@ -12,5 +12,7 @@
     "target_fps":null,
     "interpolation_exp": 2,
     "use_reference_image": false,
-    "logging": false
+    "logging": false,
+    "debug_tracing": false,
+    "debug_trace_every_n": 30
 }

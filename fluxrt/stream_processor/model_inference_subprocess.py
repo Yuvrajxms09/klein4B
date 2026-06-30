@@ -1,23 +1,30 @@
 import torch
 import time
-import os
 import cv2
 import numpy as np
+import json
 from safetensors.torch import load_file
 from multiprocessing import Process, Value, Manager
-from copy import deepcopy
 from queue import Empty
 from PIL import Image
 
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.models import AutoencoderKLFlux2
-from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
+from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM, AutoConfig
+from accelerate import init_empty_weights
 
 from fluxrt.stream_processor.interpolation_model import IFNet
 from fluxrt.stream_processor.transformer_flux2 import Flux2Transformer2DModel
 from fluxrt.utils.shared_tensor import SharedTensor
 from fluxrt.stream_processor.pipeline import Flux2KleinPipeline
 from fluxrt.stream_processor.update_controller import UpdateController
+from fluxrt.stream_processor.postprocessors import (
+    BasePostProcessor,
+    LivePortraitPostProcessor,
+)
+from fluxrt.flow_upscaler.upscaler_unet import UpscalerUNet
+from fluxrt.flow_upscaler.flow_upscaler_pipeline import FlowUpscalerPipeline
+from fluxrt.stream_processor.flux_tiny_vae import DiffusersTAEF2Wrapper
 
 
 class ModelInferenceSubprocess:
@@ -30,6 +37,7 @@ class ModelInferenceSubprocess:
         last_processing_time,
     ):
         self.running = Value("b", False)
+        self.memory_reserved = Value("i", 0)
         self.process = None
         self.config = config
         self.height = self.config["resolution"]["height"]
@@ -46,25 +54,30 @@ class ModelInferenceSubprocess:
         self.command_queue = manager.Queue()
         self.shared_state = manager.dict()
         self.interpolation_exp = self.config.get("interpolation_exp", 1)
+        self.debug_tracing = bool(self.config.get("debug_tracing", False))
+        self.debug_trace_every_n = max(1, int(self.config.get("debug_trace_every_n", 1)))
+        self._debug_frame_counter = 0
+
+    def _trace(self, message: str) -> None:
+        if self.debug_tracing:
+            print(f"[FluxRTDebug][subprocess] {message}")
 
     def init_process_state(self):
         self.device = "cuda"
+        self.dtype = torch.bfloat16
         self.process_state = {
             "prompt": self.config["default_prompt"],
             "steps": self.config["default_steps"],
             "seed": self.config["default_seed"],
         }
 
-    def load_models(self):
-        self.interpolation_model = IFNet()
-        self.interpolation_model.load_state_dict(
-            load_file("RIFE-safetensors/flownet.safetensors")
-        )
-        self.interpolation_model.to("cuda", dtype=torch.float16)
-        self.interpolation_model.eval()
+    def enable_quantization(self):
+        """Should be called before the subprocess is started."""
+        self.config["enable_int8_quantization"] = True
 
-        device = "cuda"
-        dtype = torch.bfloat16
+    def load_models_without_quantization(self):
+        device = self.device
+        dtype = self.dtype
 
         models_path = self.config["models_path"]
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -73,9 +86,6 @@ class ModelInferenceSubprocess:
         self.transformer = Flux2Transformer2DModel.from_pretrained(
             f"{models_path}/transformer", local_files_only=True, device=device
         ).to(dtype)
-        self.vae = AutoencoderKLFlux2.from_pretrained(
-            f"{models_path}/vae", local_files_only=True, device=device
-        ).to(dtype)
         self.text_encoder = Qwen3ForCausalLM.from_pretrained(
             f"{models_path}/text_encoder", local_files_only=True
         ).to(device, dtype)
@@ -83,7 +93,79 @@ class ModelInferenceSubprocess:
             f"{models_path}/tokenizer", local_files_only=True, device=device
         )
 
-        if self.config["compile_models"]:
+    def load_quantized_models(self):
+        from optimum.quanto import requantize
+        from fluxrt.stream_processor.quantized_flux2 import (
+            QuantizedFlux2Transformer2DModel,
+        )
+
+        models_path = self.config["models_path"]
+        int8_models_path = self.config["int8_models_path"]
+
+        qtransformer = QuantizedFlux2Transformer2DModel.from_pretrained(
+            int8_models_path, local_files_only=True
+        )
+        qtransformer.to(device=self.device, dtype=self.dtype)
+        self.transformer = qtransformer._wrapped
+
+        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            f"{models_path}/scheduler", local_files_only=True, device=self.device
+        )
+
+        config = AutoConfig.from_pretrained(
+            f"{int8_models_path}/text_encoder", local_files_only=True
+        )
+        with init_empty_weights():
+            text_encoder = Qwen3ForCausalLM(config)
+
+        with open(f"{int8_models_path}/text_encoder/quanto_qmap.json", "r") as f:
+            qmap = json.load(f)
+        state_dict = load_file(f"{int8_models_path}/text_encoder/model.safetensors")
+        requantize(text_encoder, state_dict=state_dict, quantization_map=qmap)
+        text_encoder.eval()
+        text_encoder.to(self.device, dtype=self.dtype)
+        self.text_encoder = text_encoder
+
+        self.tokenizer = Qwen2TokenizerFast.from_pretrained(
+            f"{int8_models_path}/tokenizer", local_files_only=True
+        )
+
+    def load_models(self):
+        self.interpolation_model = IFNet()
+        self.interpolation_model.load_state_dict(
+            load_file("RIFE-safetensors/flownet.safetensors")
+        )
+        # interpolation model requires float16 to avoid grid_sample artifacts
+        self.interpolation_model.to(self.device, torch.float16)
+        self.interpolation_model.eval()
+
+        if self.config.get("enable_int8_quantization", False):
+            self.load_quantized_models()
+        else:
+            self.load_models_without_quantization()
+
+        if self.config.get("enable_flow_upscaler", False):
+            self.upscaler_unet = UpscalerUNet()
+            state_dict = load_file("FlowUpscaler/flow_upscaler.safetensors")
+            self.upscaler_unet.load_state_dict(state_dict)
+            self.upscaler_unet.to(self.device, self.dtype)
+            self.upscaler_pipe = FlowUpscalerPipeline(
+                self.upscaler_unet, self.scheduler
+            )
+        else:
+            self.upscaler_pipe = None
+
+        if self.config.get("enable_tiny_vae", False):
+            self.vae = DiffusersTAEF2Wrapper(path="taef2/taef2.safetensors").to(
+                self.device, self.dtype
+            )
+        else:
+            models_path = self.config["models_path"]
+            self.vae = AutoencoderKLFlux2.from_pretrained(
+                f"{models_path}/vae", local_files_only=True, device=self.device
+            ).to(self.dtype)
+
+        if self.config.get("compile_models", False):
             self.transformer = torch.compile(
                 self.transformer,
             )
@@ -95,7 +177,7 @@ class ModelInferenceSubprocess:
             )
 
         reference_image_seq_len = None
-        if self.config["use_reference_image"]:
+        if self.config.get("use_reference_image", False):
             reference_image_res = self.config["reference_image_resolution"]
             reference_image_seq_len = (reference_image_res["width"] // 16) * (
                 reference_image_res["height"] // 16
@@ -117,8 +199,25 @@ class ModelInferenceSubprocess:
             transformer=self.transformer,
             update_controller=self.update_controller,
             subprocess_config=self.config,
+            upscaler_pipeline=self.upscaler_pipe,
         )
-        self.pipe.to(device)
+        self.pipe.to(self.device)
+        if self.config.get("use_lora", False):
+            self.pipe.load_lora_weights(self.config.get("lora_weights_path", ""))
+        self.lip_processor: BasePostProcessor | None = None
+        self.lip_active = False
+        lp_cfg = self.config.get("lip_transfer", {})
+        if lp_cfg.get("enable", False):
+            self.lip_processor = LivePortraitPostProcessor(
+                models_dir=lp_cfg["models_dir"]
+            )
+        self._trace(
+            "models loaded "
+            f"resolution={self.width}x{self.height} "
+            f"compile={self.config.get('compile_models', False)} "
+            f"spatial_cache={self.config.get('enable_spatial_cache', False)} "
+            f"mask_mode={self.config.get('mask_calculation_method', 'auto')}"
+        )
 
     def update_prompt_embeds(self, prompt):
         self.prompt_embeds, text_ids = self.pipe.encode_prompt(
@@ -129,9 +228,17 @@ class ModelInferenceSubprocess:
             text_encoder_out_layers=(9, 18, 27),
         )
         self.update_controller.reset_cache()
+        self._trace(
+            f"prompt updated len={len(prompt)} "
+            f"prompt_embeds={tuple(self.prompt_embeds.shape)} "
+            f"text_ids={tuple(text_ids.shape)} cache_reset=True"
+        )
 
     def init_shared_tensors(self):
         h, w = self.resolution["height"], self.resolution["width"]
+        out_h, out_w = h, w
+        if self.config.get("enable_flow_upscaler", False):
+            out_h, out_w = h * 2, w * 2
 
         self.input_shared_tensor = SharedTensor(
             (h, w, 3),
@@ -141,7 +248,7 @@ class ModelInferenceSubprocess:
         # All interpolated then one original
         output_batch_size = 2**self.interpolation_exp
         self.output_batch_shared_tensor = SharedTensor(
-            (output_batch_size, h, w, 3),
+            (output_batch_size, out_h, out_w, 3),
             name=self.output_batch_shared_tensor_name,
         )
 
@@ -154,6 +261,11 @@ class ModelInferenceSubprocess:
         self.load_models()
         self.update_prompt_embeds(self.process_state["prompt"])
         self.previous_frame = None
+        self._trace(
+            "process initialized "
+            f"target_fps={self.config.get('target_fps')} "
+            f"interpolation_exp={self.interpolation_exp}"
+        )
 
         if self.config.get("use_reference_image", False):
             image = cv2.imread(self.config.get("reference_image_path", ""))
@@ -241,6 +353,10 @@ class ModelInferenceSubprocess:
                             )
                         )
                     self.update_controller.reset_cache()
+                    self._trace(
+                        "reference image updated "
+                        f"shape={(resolution['height'], resolution['width'], 3)} cache_reset=True"
+                    )
 
                 elif cmd == "set_mask":
                     mask = payload  # numpy uint8 array of shape (h // compression_ratio, w // compression_ratio)
@@ -250,6 +366,12 @@ class ModelInferenceSubprocess:
                         .to(self.update_controller.device)
                     )
                     self.update_controller.set_mask(mask_tensor)
+                    active = int(np.count_nonzero(mask))
+                    total = int(mask.size)
+                    self._trace(
+                        f"manual mask updated shape={mask.shape} active={active}/{total} "
+                        f"active_pct={(active / total * 100.0) if total else 0.0:.2f}"
+                    )
 
         except Empty:
             pass
@@ -327,10 +449,17 @@ class ModelInferenceSubprocess:
         self.last_processing_time.value = processing_time
         self.send_frames(frames)
         self.pack_is_ready.value = True
+        self.memory_reserved.value = torch.cuda.memory_reserved() // (1024 * 1024)
 
         if self.logging:
             print(
                 f"base fps: {(1 / processing_time):.2f}, interpolated fps: {(1 / processing_time * 2**self.interpolation_exp):.2f}"
+            )
+        if self.debug_tracing and self._debug_frame_counter % self.debug_trace_every_n == 0:
+            self._trace(
+                f"frame_complete idx={self._debug_frame_counter} "
+                f"processing_ms={processing_time * 1000.0:.1f} "
+                f"reserved_mb={self.memory_reserved.value}"
             )
         return now
 
@@ -361,6 +490,12 @@ class ModelInferenceSubprocess:
         out_image = out.images[0]
         out_image = out_image * 255
         out_image = out_image.astype(np.uint8)
+        if self.debug_tracing and self._debug_frame_counter % self.debug_trace_every_n == 0:
+            self._trace(
+                f"pipe_call idx={self._debug_frame_counter} "
+                f"input_shape={frame.shape} output_shape={out_image.shape} "
+                f"steps={self.process_state['steps']} refs={len(reference_list)}"
+            )
         return out_image
 
     def convert_np_to_torch(self, frame):
@@ -378,6 +513,7 @@ class ModelInferenceSubprocess:
         self.process_init()
         prev_time = time.time()
         while self.running.value:
+            self._debug_frame_counter += 1
             self.update_process_state()
             frame = self.input_shared_tensor.to_numpy()
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)

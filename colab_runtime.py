@@ -89,6 +89,8 @@ def update_editor_state(
     canvas_colorspace: ColorSpace = "rgb",
     reference_colorspace: ColorSpace = "rgb",
     full_resolution_mask: bool = True,
+    clear_mask: bool = False,
+    clear_reference_image: bool = False,
 ) -> bool:
     return session.loop.step(
         EditorState(
@@ -99,6 +101,8 @@ def update_editor_state(
             canvas_colorspace=canvas_colorspace,
             reference_colorspace=reference_colorspace,
             full_resolution_mask=full_resolution_mask,
+            clear_mask=clear_mask,
+            clear_reference_image=clear_reference_image,
         )
     )
 
