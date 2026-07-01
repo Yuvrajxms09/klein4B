@@ -84,6 +84,19 @@ class ModelInferenceSubprocess:
             "interpolation_model": self._module_debug_info(self.interpolation_model),
         }
 
+    def _record_quantization_debug_state(self, mode: str) -> None:
+        self.shared_state["quantization_debug"] = {
+            "mode": mode,
+            "enable_nvfp4_quantization": bool(
+                self.config.get("enable_nvfp4_quantization", False)
+            ),
+            "enable_int8_quantization": bool(
+                self.config.get("enable_int8_quantization", False)
+            ),
+            "nvfp4_quantization": dict(self.config.get("nvfp4_quantization", {})),
+            "transformer": self._module_debug_info(self.transformer),
+        }
+
     def _configure_transformer_optimizations(self) -> None:
         self._record_compile_debug_state("before_compile")
         if self.config.get("compile_models", False):
@@ -120,6 +133,44 @@ class ModelInferenceSubprocess:
     def enable_quantization(self):
         """Should be called before the subprocess is started."""
         self.config["enable_int8_quantization"] = True
+
+    def load_models_with_nvfp4_quantization(self):
+        from diffusers import TorchAoConfig
+        from torchao.prototype.mx_formats import (
+            NVFP4DynamicActivationNVFP4WeightConfig,
+        )
+
+        device = self.device
+        dtype = self.dtype
+        models_path = self.config["models_path"]
+        nvfp4_config = self.config.get("nvfp4_quantization", {})
+
+        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            f"{models_path}/scheduler", local_files_only=True, device=device
+        )
+        quantization_config = TorchAoConfig(
+            NVFP4DynamicActivationNVFP4WeightConfig(
+                use_triton_kernel=bool(
+                    nvfp4_config.get("use_triton_kernel", True)
+                ),
+                use_dynamic_per_tensor_scale=bool(
+                    nvfp4_config.get("use_dynamic_per_tensor_scale", True)
+                ),
+            )
+        )
+        self.transformer = Flux2Transformer2DModel.from_pretrained(
+            f"{models_path}/transformer",
+            local_files_only=True,
+            device=device,
+            quantization_config=quantization_config,
+            torch_dtype=dtype,
+        ).to(dtype)
+        self.text_encoder = Qwen3ForCausalLM.from_pretrained(
+            f"{models_path}/text_encoder", local_files_only=True
+        ).to(device, dtype)
+        self.tokenizer = Qwen2TokenizerFast.from_pretrained(
+            f"{models_path}/tokenizer", local_files_only=True, device=device
+        )
 
     def load_models_without_quantization(self):
         device = self.device
@@ -185,10 +236,26 @@ class ModelInferenceSubprocess:
         self.interpolation_model.to(self.device, torch.float16)
         self.interpolation_model.eval()
 
-        if self.config.get("enable_int8_quantization", False):
+        enable_nvfp4_quantization = bool(
+            self.config.get("enable_nvfp4_quantization", False)
+        )
+        enable_int8_quantization = bool(
+            self.config.get("enable_int8_quantization", False)
+        )
+        if enable_nvfp4_quantization and enable_int8_quantization:
+            raise ValueError(
+                "enable_nvfp4_quantization and enable_int8_quantization cannot both be true"
+            )
+
+        if enable_nvfp4_quantization:
+            self.load_models_with_nvfp4_quantization()
+            self._record_quantization_debug_state("nvfp4")
+        elif enable_int8_quantization:
             self.load_quantized_models()
+            self._record_quantization_debug_state("int8")
         else:
             self.load_models_without_quantization()
+            self._record_quantization_debug_state("none")
 
         if self.config.get("enable_flow_upscaler", False):
             self.upscaler_unet = UpscalerUNet()
@@ -247,8 +314,10 @@ class ModelInferenceSubprocess:
             "pipe_transformer_compiled": bool(
                 hasattr(self.pipe.transformer, "_orig_mod")
             ),
+            "pipe_transformer_module": type(self.pipe.transformer).__module__,
             "pipe_vae_type": type(self.pipe.vae).__name__,
             "pipe_vae_compiled": bool(hasattr(self.pipe.vae, "_orig_mod")),
+            "pipe_vae_module": type(self.pipe.vae).__module__,
         }
         self.lip_processor: BasePostProcessor | None = None
         self.lip_active = False
@@ -261,6 +330,8 @@ class ModelInferenceSubprocess:
             "models loaded "
             f"resolution={self.width}x{self.height} "
             f"compile={self.config.get('compile_models', False)} "
+            f"nvfp4={self.config.get('enable_nvfp4_quantization', False)} "
+            f"int8={self.config.get('enable_int8_quantization', False)} "
             f"spatial_cache={self.config.get('enable_spatial_cache', False)} "
             f"mask_mode={self.config.get('mask_calculation_method', 'auto')}"
         )

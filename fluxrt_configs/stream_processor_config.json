@@ -8,6 +8,11 @@
         "width" : 576
     },
     "compile_models": true,
+    "enable_nvfp4_quantization": false,
+    "nvfp4_quantization": {
+        "use_triton_kernel": true,
+        "use_dynamic_per_tensor_scale": true
+    },
     "enable_spatial_cache": true,
     "target_fps":null,
     "interpolation_exp": 2,
