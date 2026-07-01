@@ -66,7 +66,26 @@ class ModelInferenceSubprocess:
     def _warn(self, message: str) -> None:
         print(f"[FluxRTWarning][subprocess] {message}", flush=True)
 
+    @staticmethod
+    def _module_debug_info(module) -> dict[str, object]:
+        return {
+            "type": type(module).__name__,
+            "module": type(module).__module__,
+            "compiled": bool(hasattr(module, "_orig_mod")),
+            "dtype": str(getattr(module, "dtype", None)),
+        }
+
+    def _record_compile_debug_state(self, stage: str) -> None:
+        self.shared_state["compile_debug"] = {
+            "stage": stage,
+            "compile_models_requested": bool(self.config.get("compile_models", False)),
+            "transformer": self._module_debug_info(self.transformer),
+            "vae": self._module_debug_info(self.vae),
+            "interpolation_model": self._module_debug_info(self.interpolation_model),
+        }
+
     def _configure_transformer_optimizations(self) -> None:
+        self._record_compile_debug_state("before_compile")
         if self.config.get("compile_models", False):
             try:
                 self.transformer = torch.compile(self.transformer)
@@ -75,11 +94,19 @@ class ModelInferenceSubprocess:
                     self.interpolation_model,
                 )
                 self._trace("compile applied transformer=on vae=on interpolation=on")
+                self._record_compile_debug_state("after_compile")
             except Exception as exc:
+                self._record_compile_debug_state("compile_failed")
+                self.shared_state["compile_debug_error"] = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
                 self._warn(
                     f"compile setup failed with {type(exc).__name__}: {exc}; "
                     "continuing with uncompiled modules"
                 )
+        else:
+            self._record_compile_debug_state("compile_skipped")
 
     def init_process_state(self):
         self.device = "cuda"
@@ -213,6 +240,16 @@ class ModelInferenceSubprocess:
         self.pipe.to(self.device)
         if self.config.get("use_lora", False):
             self.pipe.load_lora_weights(self.config.get("lora_weights_path", ""))
+        self.shared_state["pipeline_debug"] = {
+            "pipe_type": type(self.pipe).__name__,
+            "pipe_module": type(self.pipe).__module__,
+            "pipe_transformer_type": type(self.pipe.transformer).__name__,
+            "pipe_transformer_compiled": bool(
+                hasattr(self.pipe.transformer, "_orig_mod")
+            ),
+            "pipe_vae_type": type(self.pipe.vae).__name__,
+            "pipe_vae_compiled": bool(hasattr(self.pipe.vae, "_orig_mod")),
+        }
         self.lip_processor: BasePostProcessor | None = None
         self.lip_active = False
         lp_cfg = self.config.get("lip_transfer", {})

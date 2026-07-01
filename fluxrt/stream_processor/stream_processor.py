@@ -159,3 +159,6 @@ class StreamProcessor:
     def get_reserved_memory(self) -> int:
         """Returns reserved GPU memory in MB."""
         return self.model_inference_subprocess.memory_reserved.value
+
+    def get_subprocess_debug_state(self) -> dict:
+        return dict(self.model_inference_subprocess.shared_state)
