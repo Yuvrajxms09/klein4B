@@ -75,7 +75,7 @@ class FluxRTEditorLoop:
             )
             self._last_mask_key = mask_key
             changed = True
-        elif state.clear_mask:
+        elif state.clear_mask or self._last_mask_key is not None:
             self.runtime.clear_mask()
             self._last_mask_key = None
             changed = True

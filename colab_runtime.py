@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import blake2b
+import json
 from pathlib import Path
 from typing import Literal
+import tempfile
 import time
 
 import numpy as np
@@ -22,6 +24,27 @@ class ColabRuntimeSession:
 
     def close(self) -> None:
         self.runtime.stop()
+
+    def describe(self) -> dict:
+        sp = self.runtime.stream_processor
+        return {
+            "config_path": str(getattr(sp, "config_path", "")),
+            "resolution": sp.get_resolution(),
+            "output_resolution": sp.get_out_resolution(),
+            "input_shared_shape": tuple(self.runtime.input_tensor.shape),
+            "output_shared_shape": tuple(self.runtime.output_tensor.shape),
+            "input_shared_name": self.runtime.input_tensor.name,
+            "output_shared_name": self.runtime.output_tensor.name,
+            "compile_models": bool(sp.config.get("compile_models", False)),
+            "enable_spatial_cache": bool(sp.config.get("enable_spatial_cache", False)),
+            "mask_calculation_method": sp.config.get("mask_calculation_method", "auto"),
+            "always_update_image_cache": bool(
+                sp.config.get("always_update_image_cache", True)
+            ),
+            "interpolation_exp": int(sp.config.get("interpolation_exp", 1)),
+            "logging": bool(sp.config.get("logging", False)),
+            "debug_tracing": bool(sp.config.get("debug_tracing", False)),
+        }
 
     def latest_frame(self, *, colorspace: ColorSpace = "rgb") -> np.ndarray:
         return self.loop.latest_frame(colorspace=colorspace)
@@ -43,6 +66,19 @@ def _resolve_default_config(config_path: str | None) -> str:
     if candidate.exists():
         return str(candidate)
     return str(path.resolve())
+
+
+def _materialize_config(base_config_path: str, overrides: dict | None) -> str:
+    if not overrides:
+        return base_config_path
+
+    with open(base_config_path, "r", encoding="utf-8") as fh:
+        config = json.load(fh)
+    config.update(overrides)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump(config, fh, indent=4)
+        return fh.name
 
 
 def _frame_hash(frame: np.ndarray) -> str:
@@ -71,8 +107,11 @@ def start_colab_runtime(
     *,
     wait_until_ready: bool = True,
     ready_timeout_s: float | None = 300.0,
+    config_overrides: dict | None = None,
 ) -> ColabRuntimeSession:
-    runtime = FluxRTEditorRuntime(_resolve_default_config(config_path), start=True)
+    resolved_config = _resolve_default_config(config_path)
+    runtime_config = _materialize_config(resolved_config, config_overrides)
+    runtime = FluxRTEditorRuntime(runtime_config, start=True)
     session = ColabRuntimeSession(runtime=runtime, loop=FluxRTEditorLoop(runtime))
     if wait_until_ready:
         session.wait_until_ready(timeout_s=ready_timeout_s)

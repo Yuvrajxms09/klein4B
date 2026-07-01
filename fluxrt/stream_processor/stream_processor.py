@@ -14,7 +14,9 @@ import numpy as np
 class StreamProcessor:
     def __init__(self, config_path: str):
         self.config = self.parse_config(config_path)
+        self.config_path = config_path
         self.resolution = self.config["resolution"]
+        self._debug_tracing = bool(self.config.get("debug_tracing", False))
         output_batch_size = 2 ** self.config["interpolation_exp"]
         out_height = self.resolution["height"]
         out_width = self.resolution["width"]
@@ -33,6 +35,14 @@ class StreamProcessor:
             (output_batch_size, out_height, out_width, 3),
             create=True,
         )
+
+        if self._debug_tracing:
+            self._trace(
+                "shared tensors created "
+                f"input_shape={tuple(self.input_shared_tensor.shape)} "
+                f"output_shape={tuple(self.output_shared_tensor.shape)} "
+                f"batch_shape={tuple(self.output_batch_shared_tensor.shape)}"
+            )
 
         multiprocessing.set_start_method("spawn", force=True)
 
@@ -57,11 +67,20 @@ class StreamProcessor:
             self.frame_written,
         )
 
+    def _trace(self, message: str) -> None:
+        if self._debug_tracing:
+            print(f"[FluxRTDebug][stream] {message}")
+
     def parse_config(self, config_path: str) -> dict:
         with open(config_path, "r") as file:
             return json.load(file)
 
     def start(self) -> None:
+        self._trace(
+            "starting subprocesses "
+            f"config_path={self.config_path} resolution={self.resolution} "
+            f"out_resolution={self.out_resolution}"
+        )
         self.model_inference_subprocess.start()
         self.output_scheduler_subprocess.start()
 
@@ -72,6 +91,7 @@ class StreamProcessor:
         return self.output_shared_tensor
 
     def stop(self) -> None:
+        self._trace("stopping subprocesses")
         self.model_inference_subprocess.stop()
         self.output_scheduler_subprocess.stop()
         self.input_shared_tensor.close_and_unlink()
@@ -79,18 +99,23 @@ class StreamProcessor:
         self.output_batch_shared_tensor.close_and_unlink()
 
     def set_prompt(self, prompt: str) -> None:
+        self._trace(f"set_prompt len={len(prompt)}")
         self.model_inference_subprocess.set_param(name="prompt", value=prompt)
 
     def set_steps(self, steps: int) -> None:
+        self._trace(f"set_steps value={steps}")
         self.model_inference_subprocess.set_param(name="steps", value=steps)
 
     def set_seed(self, seed: int) -> None:
+        self._trace(f"set_seed value={seed}")
         self.model_inference_subprocess.set_param(name="seed", value=seed)
 
     def set_param(self, name: str, value) -> None:
+        self._trace(f"set_param name={name} type={type(value).__name__}")
         self.model_inference_subprocess.set_param(name=name, value=value)
 
     def enable_quantization(self) -> None:
+        self._trace("enable_quantization")
         self.model_inference_subprocess.enable_quantization()
 
     def set_reference_image(self, image: np.ndarray | None) -> None:
@@ -98,6 +123,10 @@ class StreamProcessor:
             raise ValueError(
                 "set_reference_image called but use_reference_image is not enabled in the config"
             )
+        if image is None:
+            self._trace("clear_reference_image")
+        else:
+            self._trace(f"set_reference_image shape={tuple(image.shape)} dtype={image.dtype}")
         self.model_inference_subprocess.set_reference_image(image)
 
     def set_mask(self, mask: np.ndarray) -> None:
@@ -105,6 +134,7 @@ class StreamProcessor:
             raise ValueError(
                 "set_mask called but mask_calculation_method is not set to manual in the config"
             )
+        self._trace(f"set_mask shape={tuple(mask.shape)} dtype={mask.dtype}")
         self.model_inference_subprocess.set_mask(mask)
 
     def get_resolution(self) -> dict:

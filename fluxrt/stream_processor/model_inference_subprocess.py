@@ -263,6 +263,12 @@ class ModelInferenceSubprocess:
             (output_batch_size, out_h, out_w, 3),
             name=self.output_batch_shared_tensor_name,
         )
+        self._trace(
+            "shared tensors attached "
+            f"input_shape={tuple(self.input_shared_tensor.shape)} "
+            f"output_batch_shape={tuple(self.output_batch_shared_tensor.shape)} "
+            f"resolution={self.resolution}"
+        )
 
     def process_init(self):
         """
@@ -347,11 +353,14 @@ class ModelInferenceSubprocess:
                 if cmd == "set_param":
                     name, value = payload
                     self.process_state[name] = value
+                    if name != "prompt":
+                        self._trace(f"param updated {name}={value!r}")
                     if name == "prompt":
                         self.update_prompt_embeds(value)
                 elif cmd == "set_reference_image":
                     image = payload  # numpy uint8 RGB array or None
                     resolution = self.config["reference_image_resolution"]
+                    input_shape = None if image is None else tuple(np.asarray(image).shape)
                     if image is not None:
                         image = cv2.resize(
                             image, (resolution["width"], resolution["height"])
@@ -367,7 +376,9 @@ class ModelInferenceSubprocess:
                     self.update_controller.reset_cache()
                     self._trace(
                         "reference image updated "
-                        f"shape={(resolution['height'], resolution['width'], 3)} cache_reset=True"
+                        f"input_shape={input_shape} "
+                        f"target_shape={(resolution['height'], resolution['width'], 3)} "
+                        f"cache_reset=True"
                     )
 
                 elif cmd == "set_mask":
@@ -393,6 +404,11 @@ class ModelInferenceSubprocess:
         Reads frame from input shared memory, converts to RGB float16 GPU tensors.
         """
         frame = self.input_shared_tensor.to_numpy()
+        if self.debug_tracing and self._debug_frame_counter % self.debug_trace_every_n == 0:
+            self._trace(
+                f"frame_read idx={self._debug_frame_counter} "
+                f"input_shared_shape={tuple(frame.shape)} dtype={frame.dtype}"
+            )
         frame_gpu = (
             torch.from_numpy(frame)
             .to(self.device)
@@ -442,9 +458,20 @@ class ModelInferenceSubprocess:
 
         self.previous_frame = frame
 
+        if self.debug_tracing and self._debug_frame_counter % self.debug_trace_every_n == 0:
+            self._trace(
+                f"interpolate idx={self._debug_frame_counter} "
+                f"input_shape={tuple(frame.shape)} output_batch_shape={tuple(frames_cpu.shape)}"
+            )
+
         return frames_cpu[..., ::-1]
 
     def send_frames(self, frames):
+        if self.debug_tracing and self._debug_frame_counter % self.debug_trace_every_n == 0:
+            self._trace(
+                f"send_frames idx={self._debug_frame_counter} "
+                f"batch_shape={tuple(frames.shape)} dtype={frames.dtype}"
+            )
         self.output_batch_shared_tensor.copy_from(frames)
 
     def sync_fps_and_send(self, prev_time, frames):
@@ -488,6 +515,13 @@ class ModelInferenceSubprocess:
         reference_list = [input_frame]
         if self.config["use_reference_image"]:
             reference_list.append(self.reference_image)
+        if self.debug_tracing and self._debug_frame_counter % self.debug_trace_every_n == 0:
+            ref_shapes = [tuple(np.asarray(img).shape) for img in reference_list]
+            self._trace(
+                f"pipe_input idx={self._debug_frame_counter} "
+                f"input_shape={frame.shape} refs={ref_shapes} "
+                f"steps={self.process_state['steps']} seed={self.process_state['seed']}"
+            )
 
         out = self.pipe(
             prompt_embeds=self.prompt_embeds,
@@ -532,6 +566,13 @@ class ModelInferenceSubprocess:
             self.update_process_state()
             frame = self.input_shared_tensor.to_numpy()
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            if self.debug_tracing and self._debug_frame_counter % self.debug_trace_every_n == 0:
+                self._trace(
+                    f"loop idx={self._debug_frame_counter} "
+                    f"input_rgb_shape={tuple(frame.shape)} "
+                    f"prompt_len={len(self.process_state['prompt'])} "
+                    f"steps={self.process_state['steps']} seed={self.process_state['seed']}"
+                )
             frame = self.process_frame_with_pipeline(frame)
             frame = self.convert_np_to_torch(frame)
             frames = self.interpolate_frames(frame)

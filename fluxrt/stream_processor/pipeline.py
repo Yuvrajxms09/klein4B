@@ -915,6 +915,11 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 f"batch={batch_size} steps={num_inference_steps} guidance={guidance_scale} "
                 f"height={height} width={width} refs={0 if condition_images is None else len(condition_images)}"
             )
+            if condition_images is not None:
+                self._trace(
+                    f"call={self._debug_call_counter} "
+                    f"condition_image_shapes={[tuple(img.shape) for img in condition_images]}"
+                )
 
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
@@ -1019,7 +1024,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 self._trace(
                     f"call={self._debug_call_counter} mask total={summary['total']} "
                     f"active={summary['active']} active_pct={summary['active_pct']:.2f} "
-                    f"execute_only={summary['execute_only']} execute_update={summary['execute_update']}"
+                    f"execute_only={summary['execute_only']} execute_update={summary['execute_update']} "
+                    f"final_mask_shape={tuple(mask.shape)} "
+                    f"reference_mask_shape={None if reference_image_mask is None else tuple(reference_image_mask.shape)}"
                 )
 
         # We set the index here to remove DtoH sync, helpful especially during compilation.

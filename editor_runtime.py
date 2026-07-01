@@ -34,6 +34,7 @@ class FluxRTEditorRuntime:
 
     def __init__(self, config_path: str, start: bool = True):
         self.stream_processor = StreamProcessor(self._resolve_config_path(config_path))
+        self._debug_tracing = bool(self.stream_processor.config.get("debug_tracing", False))
         self._lock = threading.RLock()
         self._started = False
         self._resolution = self.stream_processor.get_resolution()
@@ -43,6 +44,15 @@ class FluxRTEditorRuntime:
 
         self.input_tensor = self.stream_processor.get_input_tensor()
         self.output_tensor = self.stream_processor.get_output_tensor()
+
+        if self._debug_tracing:
+            self._trace(
+                "runtime initialized "
+                f"input_shared_shape={tuple(self.input_tensor.shape)} "
+                f"output_shared_shape={tuple(self.output_tensor.shape)} "
+                f"resolution={self._resolution} "
+                f"reference_resolution={self._reference_resolution}"
+            )
 
         if start:
             self.start()
@@ -63,10 +73,18 @@ class FluxRTEditorRuntime:
             return str(candidate)
         return str(path.resolve())
 
+    def _trace(self, message: str) -> None:
+        if self._debug_tracing:
+            print(f"[FluxRTDebug][editor] {message}")
+
     def start(self) -> None:
         with self._lock:
             if self._started:
                 return
+            self._trace(
+                f"starting stream processor input_shared={self.input_tensor.name} "
+                f"output_shared={self.output_tensor.name}"
+            )
             self.stream_processor.start()
             self._started = True
 
@@ -74,6 +92,7 @@ class FluxRTEditorRuntime:
         with self._lock:
             if not self._started:
                 return
+            self._trace("stopping stream processor")
             self.stream_processor.stop()
             self._started = False
 
@@ -138,33 +157,8 @@ class FluxRTEditorRuntime:
             return image
         return image[..., ::-1]
 
-    @staticmethod
-    def _fit_to_resolution(
-        image: np.ndarray,
-        *,
-        height: int,
-        width: int,
-        interpolation: int,
-    ) -> np.ndarray:
-        aspect_ratio = width / height
-        input_height, input_width = image.shape[:2]
-        input_aspect_ratio = input_width / input_height
-
-        if aspect_ratio > input_aspect_ratio:
-            crop_height = int(round(input_width / aspect_ratio))
-            crop_height = max(1, min(input_height, crop_height))
-            crop_width = input_width
-        else:
-            crop_width = int(round(input_height * aspect_ratio))
-            crop_width = max(1, min(input_width, crop_width))
-            crop_height = input_height
-
-        start_x = (input_width - crop_width) // 2
-        start_y = (input_height - crop_height) // 2
-        cropped = image[start_y : start_y + crop_height, start_x : start_x + crop_width]
-        return cv2.resize(cropped, (width, height), interpolation=interpolation)
-
     def set_prompt(self, prompt: str) -> None:
+        self._trace(f"set_prompt len={len(prompt)}")
         self.stream_processor.set_prompt(prompt)
 
     def set_reference_image(self, image, *, colorspace: ColorSpace = "rgb") -> None:
@@ -176,9 +170,14 @@ class FluxRTEditorRuntime:
             self._reference_resolution["height"],
             self._reference_resolution["width"],
         )
+        self._trace(
+            f"set_reference_image input_shape={tuple(np.asarray(image).shape)} "
+            f"cropped_shape={tuple(frame.shape)} colorspace={colorspace}"
+        )
         self.stream_processor.set_reference_image(frame)
 
     def clear_reference_image(self) -> None:
+        self._trace("clear_reference_image")
         self.stream_processor.set_reference_image(None)
 
     def set_canvas(self, image, *, colorspace: ColorSpace = "rgb") -> None:
@@ -188,10 +187,15 @@ class FluxRTEditorRuntime:
         frame = crop_maximal_rectangle(
             frame, self._resolution["height"], self._resolution["width"]
         )
+        self._trace(
+            f"set_canvas input_shape={tuple(np.asarray(image).shape)} "
+            f"cropped_shape={tuple(frame.shape)} colorspace={colorspace}"
+        )
         self.input_tensor.copy_from(frame)
 
     def set_mask(self, mask, *, full_resolution: bool = True) -> None:
         mask_arr = self._as_numpy(mask)
+        input_shape = tuple(mask_arr.shape)
         if mask_arr.ndim == 3:
             mask_arr = mask_arr[..., 0]
         if mask_arr.ndim != 2:
@@ -210,14 +214,19 @@ class FluxRTEditorRuntime:
                 mask_arr = np.clip(mask_arr, 0, 255).astype(np.uint8)
 
         if full_resolution:
+            mask_arr = crop_maximal_rectangle(
+                mask_arr,
+                self._resolution["height"],
+                self._resolution["width"],
+            )
             latent_h = self._resolution["height"] // 16
             latent_w = self._resolution["width"] // 16
-            mask_arr = self._fit_to_resolution(
+            mask_arr = cv2.resize(
                 mask_arr,
-                height=latent_h,
-                width=latent_w,
+                (latent_w, latent_h),
                 interpolation=cv2.INTER_NEAREST,
             )
+            mask_arr = cv2.dilate(mask_arr, np.ones((3, 3), np.uint8), iterations=1)
         else:
             expected_shape = (
                 self._resolution["height"] // 16,
@@ -228,12 +237,19 @@ class FluxRTEditorRuntime:
                     f"latent mask must have shape {expected_shape}, got {mask_arr.shape}"
                 )
 
+        active = int(np.count_nonzero(mask_arr))
+        self._trace(
+            "set_mask "
+            f"input_shape={input_shape} processed_shape={tuple(mask_arr.shape)} "
+            f"full_resolution={full_resolution} active={active}/{mask_arr.size}"
+        )
         mask_arr = (mask_arr > 0).astype(np.uint8) * 2
         self.stream_processor.set_mask(mask_arr)
 
     def clear_mask(self) -> None:
         latent_h = self._resolution["height"] // 16
         latent_w = self._resolution["width"] // 16
+        self._trace(f"clear_mask latent_shape={(latent_h, latent_w)}")
         self.stream_processor.set_mask(np.zeros((latent_h, latent_w), dtype=np.uint8))
 
     def update(
@@ -249,6 +265,12 @@ class FluxRTEditorRuntime:
         clear_reference_image: bool = False,
         clear_mask: bool = False,
     ) -> None:
+        self._trace(
+            "update "
+            f"prompt={prompt is not None} canvas={canvas is not None} mask={mask is not None} "
+            f"reference_image={reference_image is not None} clear_mask={clear_mask} "
+            f"clear_reference_image={clear_reference_image}"
+        )
         if prompt is not None:
             self.set_prompt(prompt)
         if clear_reference_image:
@@ -257,14 +279,15 @@ class FluxRTEditorRuntime:
             self.set_reference_image(reference_image, colorspace=reference_colorspace)
         if canvas is not None:
             self.set_canvas(canvas, colorspace=canvas_colorspace)
-        if clear_mask:
+        if clear_mask or mask is None:
             self.clear_mask()
-        elif mask is not None:
+        else:
             self.set_mask(mask, full_resolution=full_resolution_mask)
 
     def get_latest_frame(self, *, colorspace: ColorSpace = "rgb") -> np.ndarray:
         with self._lock:
             frame = self.output_tensor.to_numpy()
+        self._trace(f"get_latest_frame colorspace={colorspace} shape={tuple(frame.shape)}")
         return self._to_rgb(frame, "bgr") if colorspace == "rgb" else frame
 
     def get_shared_tensors(self):

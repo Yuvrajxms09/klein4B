@@ -25,6 +25,11 @@ class OutputSchedulerSubprocess:
 
         self.interpolation_exp = self.config.get("interpolation_exp", 1)
         self.batch_size = 2**self.interpolation_exp
+        self.debug_tracing = bool(self.config.get("debug_tracing", False))
+
+    def _trace(self, message: str) -> None:
+        if self.debug_tracing:
+            print(f"[FluxRTDebug][output] {message}")
 
     def start(self) -> None:
         self.running.value = True
@@ -54,6 +59,12 @@ class OutputSchedulerSubprocess:
             (height, width, 3),
             name=self.output_shared_tensor_name,
         )
+        self._trace(
+            "shared tensors attached "
+            f"output_batch_shape={tuple(self.output_batch_shared_tensor.shape)} "
+            f"output_shape={tuple(self.output_shared_tensor.shape)} "
+            f"batch_size={self.batch_size}"
+        )
 
     def process_main(self) -> None:
         self.process_init()
@@ -68,6 +79,12 @@ class OutputSchedulerSubprocess:
                 print(
                     f"output_scheduler: proc_time_s={proc_time:.4f}, "
                     f"batch_size={self.batch_size}, sleep_interval_s={sleep_interval:.4f}"
+                )
+            if self.debug_tracing:
+                self._trace(
+                    f"pack_ready proc_time_s={proc_time:.4f} batch_size={self.batch_size} "
+                    f"sleep_interval_s={sleep_interval:.4f} "
+                    f"output_batch_shape={tuple(self.output_batch_shared_tensor.shape)}"
                 )
 
             for i in range(self.batch_size):
