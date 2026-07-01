@@ -64,6 +64,11 @@ class OutputSchedulerSubprocess:
 
             proc_time = min(max(self.last_processing_time.value, 0.001), 1.0)
             sleep_interval = proc_time / self.batch_size
+            if self.config.get("logging", False):
+                print(
+                    f"output_scheduler: proc_time_s={proc_time:.4f}, "
+                    f"batch_size={self.batch_size}, sleep_interval_s={sleep_interval:.4f}"
+                )
 
             for i in range(self.batch_size):
                 self.output_shared_tensor.copy_from(

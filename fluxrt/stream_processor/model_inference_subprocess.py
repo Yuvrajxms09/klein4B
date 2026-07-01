@@ -2,7 +2,6 @@ import torch
 import time
 import cv2
 import numpy as np
-import json
 from safetensors.torch import load_file
 from multiprocessing import Process, Value, Manager
 from queue import Empty
@@ -10,8 +9,7 @@ from PIL import Image
 
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.models import AutoencoderKLFlux2
-from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM, AutoConfig
-from accelerate import init_empty_weights
+from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 
 from fluxrt.stream_processor.interpolation_model import IFNet
 from fluxrt.stream_processor.transformer_flux2 import Flux2Transformer2DModel
@@ -57,15 +55,6 @@ class ModelInferenceSubprocess:
         self.debug_tracing = bool(self.config.get("debug_tracing", False))
         self.debug_trace_every_n = max(1, int(self.config.get("debug_trace_every_n", 1)))
         self._debug_frame_counter = 0
-        self.attention_backend = self.config.get("attention_backend", None)
-        self.enable_cache_dit = bool(self.config.get("enable_cache_dit", False))
-        self.cache_dit_num_inference_steps = int(
-            self.config.get("cache_dit_num_inference_steps", self.config["default_steps"])
-        )
-        self.cache_dit_steps_mask = self.config.get("cache_dit_steps_mask", None)
-        self._cache_dit_enabled = False
-        self._attention_backend_applied = None
-        self._cache_dit_mismatch_warned = False
 
     def _trace(self, message: str) -> None:
         if self.debug_tracing:
@@ -74,95 +63,19 @@ class ModelInferenceSubprocess:
     def _warn(self, message: str) -> None:
         print(f"[FluxRTWarning][subprocess] {message}")
 
-    def _warn_if_cache_dit_step_mismatch(self, active_steps: int) -> None:
-        if not self._cache_dit_enabled:
-            return
-        if active_steps == self.cache_dit_num_inference_steps:
-            return
-        if self._cache_dit_mismatch_warned:
-            return
-        self._cache_dit_mismatch_warned = True
-        self._warn(
-            "cache-dit is configured for "
-            f"{self.cache_dit_num_inference_steps} steps but the active request uses "
-            f"{active_steps} steps; restart with a matching step count if you want "
-            "the cache-dit path to stay active"
-        )
-
     def _configure_transformer_optimizations(self) -> None:
-        """
-        Configure optional transformer-level optimizations after the FluxRT pipeline exists.
-
-        The pipeline must already exist because the cache-dit helper operates on the
-        pipeline wrapper, not on the raw transformer object alone.
-        """
-        if self.attention_backend is not None:
-            try:
-                from cache_dit_klein import apply_attention_backend
-
-                applied_backend = apply_attention_backend(self.pipe, self.attention_backend)
-                self._attention_backend_applied = applied_backend
-                if applied_backend is None:
-                    self._warn(
-                        f"attention backend request {self.attention_backend!r} could not be applied; "
-                        "continuing with the transformer default backend"
-                    )
-                else:
-                    self._trace(f"attention backend applied backend={applied_backend}")
-            except Exception as exc:
-                self._warn(
-                    f"attention backend request {self.attention_backend!r} failed with "
-                    f"{type(exc).__name__}: {exc}; continuing without it"
-                )
-        else:
-            self._trace("attention backend disabled in config")
-
-        if self.enable_cache_dit:
-            try:
-                from cache_dit_klein import enable_cache_dit
-
-                enable_cache_dit(
-                    self.pipe,
-                    num_inference_steps=self.cache_dit_num_inference_steps,
-                    steps_mask=self.cache_dit_steps_mask,
-                )
-                self._cache_dit_enabled = True
-                self._trace(
-                    "cache-dit enabled "
-                    f"num_inference_steps={self.cache_dit_num_inference_steps} "
-                    f"steps_mask={self.cache_dit_steps_mask or 'default'}"
-                )
-            except Exception as exc:
-                self._cache_dit_enabled = False
-                self._warn(
-                    f"cache-dit could not be enabled ({type(exc).__name__}: {exc}); "
-                    "continuing without it"
-                )
-        else:
-            self._trace("cache-dit disabled in config")
-
         if self.config.get("compile_models", False):
             try:
-                if self._cache_dit_enabled:
-                    from cache_dit_klein import apply_transformer_compile
-
-                    apply_transformer_compile(self.pipe, disable_cudagraphs=True)
-                else:
-                    self.pipe.transformer = torch.compile(
-                        self.pipe.transformer,
-                    )
-
+                self.pipe.transformer = torch.compile(
+                    self.pipe.transformer,
+                )
                 self.transformer = self.pipe.transformer
                 self.pipe.vae = torch.compile(self.pipe.vae)
                 self.vae = self.pipe.vae
                 self.interpolation_model = torch.compile(
                     self.interpolation_model,
                 )
-                self._trace(
-                    "compile applied "
-                    f"transformer={'cache-dit' if self._cache_dit_enabled else 'torch.compile'} "
-                    "vae=on interpolation=on"
-                )
+                self._trace("compile applied transformer=on vae=on interpolation=on")
             except Exception as exc:
                 self._warn(
                     f"compile setup failed with {type(exc).__name__}: {exc}; "
@@ -317,12 +230,6 @@ class ModelInferenceSubprocess:
             f"spatial_cache={self.config.get('enable_spatial_cache', False)} "
             f"mask_mode={self.config.get('mask_calculation_method', 'auto')}"
         )
-        self._trace(
-            "transformer optimizations "
-            f"attention_backend={self._attention_backend_applied or self.attention_backend or 'default'} "
-            f"cache_dit={'on' if self._cache_dit_enabled else 'off'} "
-            f"cache_dit_steps={self.cache_dit_num_inference_steps}"
-        )
 
     def update_prompt_embeds(self, prompt):
         self.prompt_embeds, text_ids = self.pipe.encode_prompt(
@@ -338,7 +245,6 @@ class ModelInferenceSubprocess:
             f"prompt_embeds={tuple(self.prompt_embeds.shape)} "
             f"text_ids={tuple(text_ids.shape)} cache_reset=True"
         )
-        self._warn_if_cache_dit_step_mismatch(int(self.process_state["steps"]))
 
     def init_shared_tensors(self):
         h, w = self.resolution["height"], self.resolution["width"]
@@ -443,8 +349,6 @@ class ModelInferenceSubprocess:
                     self.process_state[name] = value
                     if name == "prompt":
                         self.update_prompt_embeds(value)
-                    elif name == "steps":
-                        self._warn_if_cache_dit_step_mismatch(int(value))
                 elif cmd == "set_reference_image":
                     image = payload  # numpy uint8 RGB array or None
                     resolution = self.config["reference_image_resolution"]
@@ -560,8 +464,11 @@ class ModelInferenceSubprocess:
         self.memory_reserved.value = torch.cuda.memory_reserved() // (1024 * 1024)
 
         if self.logging:
+            base_fps = 1 / processing_time
+            interpolated_fps = base_fps * (2**self.interpolation_exp)
             print(
-                f"base fps: {(1 / processing_time):.2f}, interpolated fps: {(1 / processing_time * 2**self.interpolation_exp):.2f}"
+                f"processing_time_s: {processing_time:.4f}, base fps: {base_fps:.2f}, "
+                f"interpolated fps: {interpolated_fps:.2f}, reserved_mb: {self.memory_reserved.value}"
             )
         if self.debug_tracing and self._debug_frame_counter % self.debug_trace_every_n == 0:
             self._trace(
