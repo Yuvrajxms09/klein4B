@@ -7,6 +7,7 @@ Inference pipeline for `black-forest-labs/FLUX.2-klein-4B`: T2I and I2I via 4-st
 - **torch.compile** – Transformer and VAE encode/decode are compiled. `dynamic=True` so it doesn’t recompile across resolutions.
 - **Sage attention** – Default attention backend.
 - **cache-dit** – Faster transformer steps via DBCache.
+- **FluxRT stream consistency** – Shared-memory stream processing, RIFE interpolation, changed-region masking, spatial cache reuse, and optional attention-backend / cache-dit tuning for webcam and v2v workflows.
 - **Temporal consistency** – Repeated prompt calls reuse the previous frame via partial denoising for smoother iterative updates; `Flux2KleinPipeline.refine_frame(...)` exposes the same path explicitly.
 
 We tried a lighter VAE (TAEF2) for faster encode/decode; it reduced output quality, so we keep the original VAE.

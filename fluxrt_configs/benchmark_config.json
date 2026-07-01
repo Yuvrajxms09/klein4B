@@ -1,6 +1,6 @@
 {
     "default_prompt" : "Turn this into art.",
-    "default_steps" : 2,
+    "default_steps" : 4,
     "default_seed" : 52,
     "models_path" : "FLUX.2-klein-4B",
     "resolution" : {
@@ -9,6 +9,9 @@
     },
     "compile_models": true,
     "enable_spatial_cache": true,
+    "enable_cache_dit": true,
+    "attention_backend": "auto",
+    "cache_dit_num_inference_steps": 4,
     "target_fps":null,
     "interpolation_exp": 2,
     "use_reference_image": false,
