@@ -1073,6 +1073,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         interpolation_exp: int = 1,
         interpolation_output_type: str = "np",
         return_generated_frame: bool = False,
+        seed: int = 0,
         **pipe_kwargs,
     ):
         """
@@ -1090,6 +1091,34 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             input_image = image
         else:
             raise TypeError(f"Unsupported image type: {type(image)}")
+
+        if isinstance(input_image, PIL.Image.Image):
+            frame_width, frame_height = input_image.size
+        elif isinstance(input_image, np.ndarray):
+            frame_height, frame_width = input_image.shape[:2]
+        else:
+            tensor_shape = tuple(input_image.shape)
+            if input_image.ndim == 3:
+                if tensor_shape[0] == 3:
+                    frame_height, frame_width = tensor_shape[1], tensor_shape[2]
+                else:
+                    frame_height, frame_width = tensor_shape[0], tensor_shape[1]
+            elif input_image.ndim == 4:
+                if tensor_shape[1] == 3:
+                    frame_height, frame_width = tensor_shape[2], tensor_shape[3]
+                else:
+                    frame_height, frame_width = tensor_shape[1], tensor_shape[2]
+            else:
+                raise ValueError(f"Unsupported tensor shape for video frame: {tensor_shape}")
+
+        if "guidance_scale" not in pipe_kwargs:
+            pipe_kwargs["guidance_scale"] = 1.0
+        if "height" not in pipe_kwargs:
+            pipe_kwargs["height"] = int(frame_height)
+        if "width" not in pipe_kwargs:
+            pipe_kwargs["width"] = int(frame_width)
+        if "generator" not in pipe_kwargs:
+            pipe_kwargs["generator"] = torch.Generator(device=self._get_pipeline_device()).manual_seed(int(seed))
 
         total_start = time.perf_counter()
         inference_start = total_start
@@ -1134,16 +1163,21 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 "interpolation_output_type": interpolation_output_type,
                 "interpolation_frames_count": int(interpolation_frames_count),
                 "has_previous_video_output": True,
+                "seed": int(seed),
+                "guidance_scale": float(pipe_kwargs["guidance_scale"]),
+                "height": int(pipe_kwargs["height"]),
+                "width": int(pipe_kwargs["width"]),
                 "generated_frame_shape": tuple(current_frame.shape) if hasattr(current_frame, "shape") else None,
             }
         )
         self._log_video_debug(
-            "frame processed inference_s=%.4f interpolation_s=%.4f total_s=%.4f frames=%s interpolation_exp=%s",
+            "frame processed inference_s=%.4f interpolation_s=%.4f total_s=%.4f frames=%s interpolation_exp=%s seed=%s",
             inference_time_s,
             interpolation_time_s,
             total_time_s,
             interpolation_frames_count,
             interpolation_exp,
+            seed,
         )
 
         if return_generated_frame:
