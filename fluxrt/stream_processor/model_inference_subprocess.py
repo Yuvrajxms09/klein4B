@@ -1,15 +1,18 @@
-import torch
+import json
 import time
+
 import cv2
 import numpy as np
+import torch
 from safetensors.torch import load_file
 from multiprocessing import Process, Value, Manager
 from queue import Empty
 from PIL import Image
 
+from accelerate import init_empty_weights
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.models import AutoencoderKLFlux2
-from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
+from transformers import AutoConfig, Qwen2TokenizerFast, Qwen3ForCausalLM
 
 from fluxrt.stream_processor.interpolation_model import IFNet
 from fluxrt.stream_processor.transformer_flux2 import Flux2Transformer2DModel
@@ -58,20 +61,16 @@ class ModelInferenceSubprocess:
 
     def _trace(self, message: str) -> None:
         if self.debug_tracing:
-            print(f"[FluxRTDebug][subprocess] {message}")
+            print(f"[FluxRTDebug][subprocess] {message}", flush=True)
 
     def _warn(self, message: str) -> None:
-        print(f"[FluxRTWarning][subprocess] {message}")
+        print(f"[FluxRTWarning][subprocess] {message}", flush=True)
 
     def _configure_transformer_optimizations(self) -> None:
         if self.config.get("compile_models", False):
             try:
-                self.pipe.transformer = torch.compile(
-                    self.pipe.transformer,
-                )
-                self.transformer = self.pipe.transformer
-                self.pipe.vae = torch.compile(self.pipe.vae)
-                self.vae = self.pipe.vae
+                self.transformer = torch.compile(self.transformer)
+                self.vae = torch.compile(self.vae)
                 self.interpolation_model = torch.compile(
                     self.interpolation_model,
                 )
@@ -81,8 +80,6 @@ class ModelInferenceSubprocess:
                     f"compile setup failed with {type(exc).__name__}: {exc}; "
                     "continuing with uncompiled modules"
                 )
-                self.transformer = self.pipe.transformer
-                self.vae = self.pipe.vae
 
     def init_process_state(self):
         self.device = "cuda"
@@ -186,6 +183,7 @@ class ModelInferenceSubprocess:
             self.vae = AutoencoderKLFlux2.from_pretrained(
                 f"{models_path}/vae", local_files_only=True, device=self.device
             ).to(self.dtype)
+        self._configure_transformer_optimizations()
 
         reference_image_seq_len = None
         if self.config.get("use_reference_image", False):
@@ -215,7 +213,6 @@ class ModelInferenceSubprocess:
         self.pipe.to(self.device)
         if self.config.get("use_lora", False):
             self.pipe.load_lora_weights(self.config.get("lora_weights_path", ""))
-        self._configure_transformer_optimizations()
         self.lip_processor: BasePostProcessor | None = None
         self.lip_active = False
         lp_cfg = self.config.get("lip_transfer", {})
