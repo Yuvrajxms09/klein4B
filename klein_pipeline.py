@@ -188,6 +188,38 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
     model_cpu_offload_seq = "text_encoder->transformer->vae"
     _callback_tensor_inputs = ["latents", "prompt_embeds"]
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str | Path, **kwargs):
+        if kwargs.get("transformer") is None:
+            transformer_load_kwargs = {}
+            transformer_kwarg_names = {
+                "cache_dir",
+                "force_download",
+                "proxies",
+                "local_files_only",
+                "token",
+                "revision",
+                "torch_dtype",
+                "use_safetensors",
+                "variant",
+                "low_cpu_mem_usage",
+                "device_map",
+                "max_memory",
+                "offload_folder",
+                "offload_state_dict",
+                "quantization_config",
+            }
+            for name in transformer_kwarg_names:
+                if name in kwargs:
+                    transformer_load_kwargs[name] = kwargs[name]
+            transformer_load_kwargs["subfolder"] = "transformer"
+            kwargs["transformer"] = Flux2Transformer2DModel.from_pretrained(
+                pretrained_model_name_or_path,
+                **transformer_load_kwargs,
+            )
+
+        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+
     def __init__(
         self,
         scheduler: FlowMatchEulerDiscreteScheduler,
