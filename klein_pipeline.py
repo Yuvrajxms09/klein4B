@@ -14,21 +14,32 @@
 # limitations under the License.
 
 import inspect
+from pathlib import Path
+import time
 from typing import Any, Callable
 
 import numpy as np
 import PIL
 import torch
+import torch.nn.functional as F
+from safetensors.torch import load_file
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 
 from diffusers.loaders import Flux2LoraLoaderMixin
-from diffusers.models import AutoencoderKLFlux2, Flux2Transformer2DModel
+from diffusers.models import AutoencoderKLFlux2
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import is_torch_xla_available, logging, replace_example_docstring
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 from diffusers.pipelines.flux2.pipeline_output import Flux2PipelineOutput
+
+from fluxrt.stream_processor.transformer_flux2 import (
+    Flux2Transformer2DModel,
+    SpatialCache,
+)
+from fluxrt.stream_processor.interpolation_model import IFNet
+from fluxrt.stream_processor.update_controller import UpdateController
 
 
 if is_torch_xla_available():
@@ -222,6 +233,206 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         # Optional torch.compile wrappers (set by enable_compile())
         self._vae_encode_fn: Callable | None = None
         self._vae_decode_fn: Callable | None = None
+
+        # Optional FluxRT-style spatial consistency state.
+        self.update_controller: UpdateController | None = None
+        self.spatial_cache: dict[int, SpatialCache] = {}
+        self._spatial_consistency_enabled: bool = False
+        self._spatial_consistency_config: dict[str, Any] = {}
+        self._spatial_debug_enabled: bool = False
+        self._spatial_debug_state: dict[str, Any] = {"enabled": False}
+        self._last_prompt_cache_key: tuple[Any, ...] | None = None
+        self._pending_spatial_mask: tuple[torch.Tensor | np.ndarray, bool, bool] | None = None
+        self._frame_interpolator: IFNet | None = None
+        self._frame_interpolator_weights_path: str | None = None
+        self._frame_interpolator_compiled: bool = False
+        self._previous_video_output: PIL.Image.Image | np.ndarray | torch.Tensor | None = None
+        self._video_debug_enabled: bool = False
+        self._video_debug_state: dict[str, Any] = {"enabled": False}
+
+    def _log_spatial_debug(self, message: str, *args) -> None:
+        if self._spatial_debug_enabled:
+            logger.info("[spatial] " + message, *args)
+
+    def _log_video_debug(self, message: str, *args) -> None:
+        if self._video_debug_enabled:
+            logger.info("[video] " + message, *args)
+
+    def enable_spatial_consistency(
+        self,
+        *,
+        compression_ratio: int = 16,
+        mask_calculation_method: str = "auto",
+        always_update_image_cache: bool = True,
+        reset_period: float | None = None,
+        debug: bool = False,
+    ) -> None:
+        self._spatial_consistency_enabled = True
+        self._spatial_debug_enabled = debug
+        self._spatial_consistency_config = {
+            "compression_ratio": int(compression_ratio),
+            "mask_calculation_method": mask_calculation_method,
+            "always_update_image_cache": bool(always_update_image_cache),
+            "reset_period": reset_period,
+        }
+        self.update_controller = None
+        self.spatial_cache.clear()
+        self._pending_spatial_mask = None
+        self._spatial_debug_state = {
+            "enabled": True,
+            "config": dict(self._spatial_consistency_config),
+            "last_event": "enabled",
+        }
+        self._log_spatial_debug("enabled with config=%s", self._spatial_consistency_config)
+
+    def disable_spatial_consistency(self) -> None:
+        self._spatial_consistency_enabled = False
+        self.update_controller = None
+        self.spatial_cache.clear()
+        self._pending_spatial_mask = None
+        self._spatial_debug_state = {"enabled": False, "last_event": "disabled"}
+
+    def enable_video_debug(self, enabled: bool = True) -> None:
+        self._video_debug_enabled = bool(enabled)
+        self._video_debug_state["enabled"] = self._video_debug_enabled
+
+    def get_video_debug_state(self) -> dict[str, Any]:
+        return dict(self._video_debug_state)
+
+    def reset_spatial_consistency_state(self, *, reason: str = "manual") -> None:
+        self.spatial_cache.clear()
+        if self.update_controller is not None:
+            self.update_controller.reset_cache()
+        self._spatial_debug_state["last_event"] = f"reset:{reason}"
+        self._log_spatial_debug("reset state reason=%s", reason)
+
+    def set_spatial_consistency_mask(
+        self,
+        mask: torch.Tensor | np.ndarray,
+        *,
+        full_resolution: bool = False,
+        dilate: bool = True,
+    ) -> None:
+        if self.update_controller is None:
+            self._pending_spatial_mask = (mask, full_resolution, dilate)
+            self._spatial_debug_state["last_event"] = "pending_manual_mask"
+            self._log_spatial_debug(
+                "manual mask queued full_resolution=%s until controller is initialized",
+                full_resolution,
+            )
+            return
+        self._apply_spatial_consistency_mask(mask, full_resolution=full_resolution, dilate=dilate)
+
+    def _apply_spatial_consistency_mask(
+        self,
+        mask: torch.Tensor | np.ndarray,
+        *,
+        full_resolution: bool,
+        dilate: bool,
+    ) -> None:
+        if not isinstance(mask, torch.Tensor):
+            mask = torch.as_tensor(mask)
+        mask = mask.to(device=self.update_controller.device)
+
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        if mask.ndim != 3:
+            raise ValueError(f"Expected mask with 2 or 3 dims, got shape={tuple(mask.shape)}")
+
+        mask = (mask > 0).to(torch.float32)
+
+        if full_resolution:
+            mask = F.interpolate(
+                mask.unsqueeze(0),
+                size=(self.update_controller.mask_height, self.update_controller.mask_width),
+                mode="nearest",
+            ).squeeze(0)
+            if dilate:
+                mask = (F.max_pool2d(mask.unsqueeze(0), kernel_size=3, stride=1, padding=1) > 0).to(torch.float32).squeeze(0)
+
+        if mask.shape != (1, self.update_controller.mask_height, self.update_controller.mask_width):
+            raise ValueError(
+                "Manual mask has wrong shape. "
+                f"Expected {(1, self.update_controller.mask_height, self.update_controller.mask_width)}, "
+                f"got {tuple(mask.shape)}"
+            )
+
+        mask = (mask > 0).to(torch.int32) * 2
+        self.update_controller.set_mask(mask)
+        self._spatial_debug_state["last_manual_mask_shape"] = tuple(mask.shape)
+        self._spatial_debug_state["last_manual_mask_full_resolution"] = bool(full_resolution)
+        self._spatial_debug_state["last_event"] = "manual_mask_applied"
+        self._log_spatial_debug("manual mask set shape=%s full_resolution=%s", tuple(mask.shape), full_resolution)
+
+    def get_spatial_debug_state(self) -> dict[str, Any]:
+        return dict(self._spatial_debug_state)
+
+    def _ensure_spatial_consistency_state(
+        self,
+        *,
+        height: int,
+        width: int,
+        text_seq_len: int,
+        reference_image_seq_len: int | None,
+        device,
+        dtype,
+    ) -> None:
+        if not self._spatial_consistency_enabled:
+            return
+
+        needs_rebuild = (
+            self.update_controller is None
+            or self.update_controller.height != height
+            or self.update_controller.width != width
+            or self.update_controller.text_seq_len != text_seq_len
+            or self.update_controller.reference_image_seq_len != reference_image_seq_len
+            or self.update_controller.device != device
+            or self.update_controller.dtype != dtype
+        )
+        if not needs_rebuild:
+            return
+
+        controller_config = dict(self._spatial_consistency_config)
+        reset_period = controller_config.pop("reset_period", None)
+        self.update_controller = UpdateController(
+            controller_config,
+            height=height,
+            width=width,
+            compression_ratio=int(controller_config["compression_ratio"]),
+            text_seq_len=text_seq_len,
+            device=device,
+            dtype=dtype,
+            reset_period=reset_period,
+            reference_image_seq_len=reference_image_seq_len,
+        )
+        self.spatial_cache.clear()
+        if self._pending_spatial_mask is not None:
+            pending_mask, full_resolution, dilate = self._pending_spatial_mask
+            self._apply_spatial_consistency_mask(
+                pending_mask,
+                full_resolution=full_resolution,
+                dilate=dilate,
+            )
+            self._pending_spatial_mask = None
+        self._spatial_debug_state.update(
+            {
+                "enabled": True,
+                "height": height,
+                "width": width,
+                "text_seq_len": text_seq_len,
+                "reference_image_seq_len": reference_image_seq_len,
+                "device": str(device),
+                "dtype": str(dtype),
+                "last_event": "controller_rebuilt",
+            }
+        )
+        self._log_spatial_debug(
+            "controller rebuilt height=%s width=%s text_seq_len=%s reference_image_seq_len=%s",
+            height,
+            width,
+            text_seq_len,
+            reference_image_seq_len,
+        )
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -449,8 +660,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         prompt_embeds: torch.Tensor | None = None,
         max_sequence_length: int = 512,
         text_encoder_out_layers: tuple[int] = (9, 18, 27),
+        track_spatial_prompt: bool = True,
     ):
         device = device or self._execution_device
+        using_external_prompt_embeds = prompt_embeds is not None
 
         if prompt is None:
             prompt = ""
@@ -463,13 +676,23 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             tuple(text_encoder_out_layers),
         )
 
-        if prompt_embeds is None and self._cache_prompt and cache_key in self._prompt_cache:
+        if track_spatial_prompt and self._spatial_consistency_enabled:
+            if using_external_prompt_embeds:
+                self.reset_spatial_consistency_state(reason="prompt_embeds_supplied")
+                self._last_prompt_cache_key = None
+            elif self._last_prompt_cache_key is not None and cache_key != self._last_prompt_cache_key:
+                self.reset_spatial_consistency_state(reason="prompt_changed")
+                self._last_prompt_cache_key = cache_key
+            else:
+                self._last_prompt_cache_key = cache_key
+
+        if not using_external_prompt_embeds and self._cache_prompt and cache_key in self._prompt_cache:
             cached_embeds, cached_ids = self._prompt_cache[cache_key]
             dev_type = getattr(device, "type", str(device).split(":")[0] if isinstance(device, str) else "")
             non_blocking = dev_type == "cuda"
             return cached_embeds.to(device, non_blocking=non_blocking), cached_ids.to(device, non_blocking=non_blocking)
 
-        if prompt_embeds is None:
+        if not using_external_prompt_embeds:
             prompt_embeds = self._get_qwen3_prompt_embeds(
                 text_encoder=self.text_encoder,
                 tokenizer=self.tokenizer,
@@ -485,7 +708,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
         text_ids = self._prepare_text_ids(prompt_embeds)
         text_ids = text_ids.to(device)
-        if self._cache_prompt:
+        if not using_external_prompt_embeds and self._cache_prompt:
             self._prompt_cache[cache_key] = (prompt_embeds, text_ids)
         return prompt_embeds, text_ids
 
@@ -644,6 +867,256 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._timesteps_cache.clear()
         self._image_latent_ids_cache.clear()
         self._prompt_cache.clear()
+
+    def _get_pipeline_device(self) -> torch.device:
+        return next(self.transformer.parameters()).device
+
+    def enable_frame_interpolation(
+        self,
+        weights_path: str | Path = "RIFE-safetensors/flownet.safetensors",
+        *,
+        compile_model: bool = False,
+    ) -> None:
+        weights_path = Path(weights_path)
+        if not weights_path.exists():
+            raise FileNotFoundError(f"RIFE weights not found: {weights_path}")
+
+        interpolator = IFNet()
+        interpolator.load_state_dict(load_file(str(weights_path)))
+        interpolator.to(self._get_pipeline_device(), torch.float16)
+        interpolator.eval()
+
+        if compile_model:
+            try:
+                interpolator = torch.compile(interpolator, fullgraph=False)
+                self._frame_interpolator_compiled = True
+            except Exception as exc:
+                self._frame_interpolator_compiled = False
+                logger.warning("frame interpolator compile fallback to eager: %r", exc)
+        else:
+            self._frame_interpolator_compiled = False
+
+        self._frame_interpolator = interpolator
+        self._frame_interpolator_weights_path = str(weights_path)
+        logger.info(
+            "frame interpolation enabled weights=%s compiled=%s",
+            self._frame_interpolator_weights_path,
+            self._frame_interpolator_compiled,
+        )
+
+    def disable_frame_interpolation(self) -> None:
+        self._frame_interpolator = None
+        self._frame_interpolator_weights_path = None
+        self._frame_interpolator_compiled = False
+
+    def reset_video_state(self) -> None:
+        self._previous_video_output = None
+        self._video_debug_state.update(
+            {
+                "enabled": self._video_debug_enabled,
+                "last_event": "video_state_reset",
+                "has_previous_video_output": False,
+            }
+        )
+
+    def _frame_to_tensor(self, frame: PIL.Image.Image | np.ndarray | torch.Tensor) -> torch.Tensor:
+        if isinstance(frame, PIL.Image.Image):
+            frame = np.asarray(frame.convert("RGB"))
+
+        if isinstance(frame, np.ndarray):
+            if frame.ndim != 3 or frame.shape[2] != 3:
+                raise ValueError(f"Expected HWC RGB ndarray, got shape={frame.shape}")
+            tensor = torch.from_numpy(np.ascontiguousarray(frame)).permute(2, 0, 1).unsqueeze(0)
+            if tensor.dtype == torch.uint8:
+                tensor = tensor.to(torch.float32).div_(255.0)
+            else:
+                tensor = tensor.to(torch.float32)
+            return tensor.to(device=self._get_pipeline_device(), dtype=torch.float16)
+
+        if isinstance(frame, torch.Tensor):
+            tensor = frame.detach()
+            if tensor.ndim == 3:
+                if tensor.shape[0] == 3:
+                    tensor = tensor.unsqueeze(0)
+                elif tensor.shape[-1] == 3:
+                    tensor = tensor.permute(2, 0, 1).unsqueeze(0)
+                else:
+                    raise ValueError(f"Expected CHW or HWC RGB tensor, got shape={tuple(tensor.shape)}")
+            elif tensor.ndim == 4:
+                if tensor.shape[0] != 1:
+                    raise ValueError(f"Expected batch size 1 tensor, got shape={tuple(tensor.shape)}")
+                if tensor.shape[1] != 3 and tensor.shape[-1] == 3:
+                    tensor = tensor.permute(0, 3, 1, 2)
+            else:
+                raise ValueError(f"Expected 3D or 4D tensor, got shape={tuple(tensor.shape)}")
+
+            tensor = tensor.to(device=self._get_pipeline_device(), dtype=torch.float32)
+            if tensor.max().item() > 1.0 or tensor.min().item() < 0.0:
+                tensor = tensor.div(255.0)
+            return tensor.to(torch.float16)
+
+        raise TypeError(f"Unsupported frame type: {type(frame)}")
+
+    @staticmethod
+    def _frames_tensor_to_output(
+        frames: torch.Tensor,
+        output_type: str,
+    ) -> list[np.ndarray] | list[PIL.Image.Image] | torch.Tensor:
+        if frames.ndim != 4 or frames.shape[1] != 3:
+            raise ValueError(f"Expected frames with shape (N, 3, H, W), got {tuple(frames.shape)}")
+
+        if output_type == "pt":
+            return frames
+
+        frames_uint8 = (
+            frames.clamp(0, 1)
+            .mul(255)
+            .to(torch.uint8)
+            .permute(0, 2, 3, 1)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+        if output_type == "np":
+            return [frame for frame in frames_uint8]
+        if output_type == "pil":
+            return [PIL.Image.fromarray(frame) for frame in frames_uint8]
+        raise ValueError(f"Unsupported output_type: {output_type}")
+
+    @torch.no_grad()
+    def interpolate_frames(
+        self,
+        start_frame: PIL.Image.Image | np.ndarray | torch.Tensor,
+        end_frame: PIL.Image.Image | np.ndarray | torch.Tensor,
+        *,
+        interpolation_exp: int = 1,
+        output_type: str = "np",
+        include_anchors: bool = False,
+    ) -> list[np.ndarray] | list[PIL.Image.Image] | torch.Tensor:
+        if self._frame_interpolator is None:
+            raise RuntimeError("Frame interpolation is not enabled. Call enable_frame_interpolation() first.")
+        if interpolation_exp < 0:
+            raise ValueError(f"interpolation_exp must be >= 0, got {interpolation_exp}")
+
+        start = self._frame_to_tensor(start_frame)
+        end = self._frame_to_tensor(end_frame)
+        if start.shape != end.shape:
+            raise ValueError(
+                "Interpolation frames must share the same shape. "
+                f"Got {tuple(start.shape)} vs {tuple(end.shape)}"
+            )
+
+        if interpolation_exp == 0:
+            frames = torch.cat([start, end], dim=0) if include_anchors else end
+            return self._frames_tensor_to_output(frames, output_type)
+
+        frames = torch.cat([start, end], dim=0)
+        for _ in range(interpolation_exp):
+            batch_size = frames.shape[0]
+            prevs = frames[:-1]
+            nexts = frames[1:]
+            mids = self._frame_interpolator(torch.cat([prevs, nexts], dim=1))
+            height, width = frames.shape[2:]
+            new_frames = torch.empty(
+                2 * batch_size - 1,
+                3,
+                height,
+                width,
+                device=frames.device,
+                dtype=frames.dtype,
+            )
+            new_frames[0::2] = frames
+            new_frames[1::2] = mids
+            frames = new_frames
+
+        if not include_anchors:
+            frames = frames[1:]
+        return self._frames_tensor_to_output(frames, output_type)
+
+    @torch.no_grad()
+    def process_video_frame(
+        self,
+        image: PIL.Image.Image | np.ndarray | torch.Tensor,
+        *,
+        interpolation_exp: int = 1,
+        interpolation_output_type: str = "np",
+        return_generated_frame: bool = False,
+        **pipe_kwargs,
+    ):
+        """
+        Run one v2v frame through the pipeline and, when a previous stylized frame exists,
+        return the RIFE-interpolated pack between the previous and current stylized outputs.
+
+        This keeps only lightweight backend state. Frontend/runtime code can decide how to
+        pace or display the returned frames.
+        """
+        if isinstance(image, torch.Tensor):
+            input_image = image
+        elif isinstance(image, np.ndarray):
+            input_image = PIL.Image.fromarray(np.asarray(image, dtype=np.uint8))
+        elif isinstance(image, PIL.Image.Image):
+            input_image = image
+        else:
+            raise TypeError(f"Unsupported image type: {type(image)}")
+
+        total_start = time.perf_counter()
+        inference_start = total_start
+        generation = self(
+            image=input_image,
+            output_type="np",
+            **pipe_kwargs,
+        )
+        inference_time_s = time.perf_counter() - inference_start
+        current_frame = generation.images[0]
+
+        interpolation_time_s = 0.0
+        if self._previous_video_output is None or interpolation_exp == 0:
+            frames = [current_frame] if interpolation_output_type == "np" else self._frames_tensor_to_output(
+                self._frame_to_tensor(current_frame),
+                interpolation_output_type,
+            )
+            interpolation_frames_count = len(frames) if not isinstance(frames, torch.Tensor) else int(frames.shape[0])
+        else:
+            interpolation_start = time.perf_counter()
+            frames = self.interpolate_frames(
+                self._previous_video_output,
+                current_frame,
+                interpolation_exp=interpolation_exp,
+                output_type=interpolation_output_type,
+                include_anchors=False,
+            )
+            interpolation_time_s = time.perf_counter() - interpolation_start
+            interpolation_frames_count = len(frames) if not isinstance(frames, torch.Tensor) else int(frames.shape[0])
+
+        self._previous_video_output = current_frame
+        total_time_s = time.perf_counter() - total_start
+
+        self._video_debug_state.update(
+            {
+                "enabled": self._video_debug_enabled,
+                "last_event": "video_frame_processed",
+                "inference_time_s": float(inference_time_s),
+                "interpolation_time_s": float(interpolation_time_s),
+                "total_time_s": float(total_time_s),
+                "interpolation_exp": int(interpolation_exp),
+                "interpolation_output_type": interpolation_output_type,
+                "interpolation_frames_count": int(interpolation_frames_count),
+                "has_previous_video_output": True,
+                "generated_frame_shape": tuple(current_frame.shape) if hasattr(current_frame, "shape") else None,
+            }
+        )
+        self._log_video_debug(
+            "frame processed inference_s=%.4f interpolation_s=%.4f total_s=%.4f frames=%s interpolation_exp=%s",
+            inference_time_s,
+            interpolation_time_s,
+            total_time_s,
+            interpolation_frames_count,
+            interpolation_exp,
+        )
+
+        if return_generated_frame:
+            return frames, current_frame
+        return frames
 
     def enable_compile(
         self,
@@ -911,6 +1384,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             num_images_per_prompt=num_images_per_prompt,
             max_sequence_length=max_sequence_length,
             text_encoder_out_layers=text_encoder_out_layers,
+            track_spatial_prompt=True,
         )
 
         if self.do_classifier_free_guidance:
@@ -924,6 +1398,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
                 text_encoder_out_layers=text_encoder_out_layers,
+                track_spatial_prompt=False,
             )
 
         # 4. process images
@@ -983,6 +1458,124 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 non_blocking_h2d=self._preprocess_non_blocking_h2d,
             )
 
+        sparse_mask = None
+        if self._spatial_consistency_enabled and condition_images is not None:
+            effective_batch_size = batch_size * num_images_per_prompt
+            if effective_batch_size != 1:
+                raise ValueError(
+                    "Spatial consistency currently supports only batch size 1. "
+                    f"Got effective batch size {effective_batch_size}."
+                )
+            primary_condition_cpu = condition_images[0]
+            primary_condition = primary_condition_cpu.to(
+                device=device,
+                dtype=self.vae.dtype,
+                non_blocking=self._preprocess_non_blocking_h2d,
+            )
+            primary_height = int(primary_condition.shape[-2])
+            primary_width = int(primary_condition.shape[-1])
+
+            primary_image_seq_len = (primary_height // 16) * (primary_width // 16)
+            total_image_seq_len = int(image_latents.shape[1]) if image_latents is not None else 0
+            reference_image_seq_len = total_image_seq_len - primary_image_seq_len
+            if reference_image_seq_len <= 0:
+                reference_image_seq_len = None
+
+            self._ensure_spatial_consistency_state(
+                height=primary_height,
+                width=primary_width,
+                text_seq_len=int(prompt_embeds.shape[1]),
+                reference_image_seq_len=reference_image_seq_len,
+                device=primary_condition.device,
+                dtype=primary_condition.dtype,
+            )
+
+            image_mask = self.update_controller.update_and_get_mask(primary_condition)
+            image_mask = image_mask.reshape(1, image_mask.shape[1] * image_mask.shape[2])
+            if image_mask.shape[1] != primary_image_seq_len:
+                raise RuntimeError(
+                    "Spatial image mask token count mismatch. "
+                    f"Expected {primary_image_seq_len}, got {image_mask.shape[1]}"
+                )
+            sparse_mask = torch.cat(
+                [
+                    self.update_controller.use_text_mask(),
+                    image_mask,
+                    image_mask,
+                ],
+                dim=-1,
+            )
+            reference_image_mask = self.update_controller.use_reference_image_mask()
+            if reference_image_mask is not None:
+                sparse_mask = torch.cat([sparse_mask, reference_image_mask], dim=-1)
+
+            expected_sparse_mask_tokens = prompt_embeds.shape[1] + latents.shape[1]
+            if image_latents is not None:
+                expected_sparse_mask_tokens += image_latents.shape[1]
+            if sparse_mask.shape[1] != expected_sparse_mask_tokens:
+                raise RuntimeError(
+                    "Spatial mask full sequence length mismatch. "
+                    f"Expected {expected_sparse_mask_tokens}, got {sparse_mask.shape[1]}"
+                )
+
+            active_tokens = int((sparse_mask > 0).sum().item())
+            total_tokens = int(sparse_mask.numel())
+            update_tokens = int((sparse_mask == 2).sum().item())
+            execute_tokens = int((sparse_mask > 0).sum().item())
+            self._spatial_debug_state.update(
+                {
+                    "enabled": True,
+                    "mask_shape": tuple(sparse_mask.shape),
+                    "mask_dtype": str(sparse_mask.dtype),
+                    "active_tokens": active_tokens,
+                    "update_tokens": update_tokens,
+                    "execute_tokens": execute_tokens,
+                    "total_tokens": total_tokens,
+                    "active_ratio": float(active_tokens / max(total_tokens, 1)),
+                    "primary_condition_cpu_shape": tuple(primary_condition_cpu.shape),
+                    "primary_condition_shape": tuple(primary_condition.shape),
+                    "image_latents_shape": tuple(image_latents.shape) if image_latents is not None else None,
+                    "image_latent_ids_shape": tuple(image_latent_ids.shape) if image_latent_ids is not None else None,
+                    "last_event": "mask_ready",
+                }
+            )
+            self._log_spatial_debug(
+                "mask ready active=%s/%s update=%s primary_shape=%s image_latents_shape=%s",
+                active_tokens,
+                total_tokens,
+                update_tokens,
+                tuple(primary_condition.shape),
+                tuple(image_latents.shape) if image_latents is not None else None,
+            )
+        elif self._spatial_consistency_enabled:
+            self.reset_spatial_consistency_state(reason="missing_condition_image")
+            self._spatial_debug_state.update(
+                {
+                    "enabled": True,
+                    "last_event": "missing_condition_image",
+                }
+            )
+
+        self._spatial_debug_state.update(
+            {
+                "call_height": int(height),
+                "call_width": int(width),
+                "num_inference_steps": int(num_inference_steps),
+                "guidance_scale": float(guidance_scale),
+                "condition_image_count": 0 if condition_images is None else len(condition_images),
+                "sparse_path_active": sparse_mask is not None,
+            }
+        )
+        if self._spatial_consistency_enabled:
+            self._log_spatial_debug(
+                "call prepared sparse_active=%s condition_images=%s size=%sx%s steps=%s",
+                sparse_mask is not None,
+                0 if condition_images is None else len(condition_images),
+                height,
+                width,
+                num_inference_steps,
+            )
+
         # 6. Prepare timesteps
         image_seq_len = latents.shape[1]
         sigmas_arg = np.asarray(sigmas) if sigmas is not None else None
@@ -1024,6 +1617,26 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                     torch.compiler.cudagraph_mark_step_begin()
 
+                spatial_cache = None
+                if sparse_mask is not None:
+                    timestep_key = int(t.item() if isinstance(t, torch.Tensor) else t)
+                    if timestep_key not in self.spatial_cache:
+                        self.spatial_cache[timestep_key] = SpatialCache(
+                            image_seq_len=latent_model_input.shape[1],
+                            text_seq_len=int(prompt_embeds.shape[1]),
+                            output_channels=128,
+                            device=latent_model_input.device,
+                            dtype=latent_model_input.dtype,
+                        )
+                        self._log_spatial_debug(
+                            "created spatial cache timestep=%s seq_len=%s",
+                            timestep_key,
+                            latent_model_input.shape[1],
+                        )
+                    spatial_cache = self.spatial_cache[timestep_key]
+                    self._spatial_debug_state["last_timestep_key"] = timestep_key
+                    self._spatial_debug_state["spatial_cache_entries"] = len(self.spatial_cache)
+
                 with self.transformer.cache_context("cond"):
                     noise_pred = self.transformer(
                         hidden_states=latent_model_input,  # (B, image_seq_len, C)
@@ -1033,6 +1646,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                         txt_ids=text_ids,  # B, text_seq_len, 4
                         img_ids=latent_image_ids,  # B, image_seq_len, 4
                         joint_attention_kwargs=self.attention_kwargs,
+                        mask=sparse_mask,
+                        spatial_cache=spatial_cache,
                         return_dict=False,
                     )[0]
 
