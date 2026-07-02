@@ -15,6 +15,7 @@
 
 import inspect
 from pathlib import Path
+import threading
 import time
 from typing import Any, Callable
 
@@ -281,6 +282,24 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._previous_video_output: PIL.Image.Image | np.ndarray | torch.Tensor | None = None
         self._video_debug_enabled: bool = False
         self._video_debug_state: dict[str, Any] = {"enabled": False}
+        self._video_stream_runtime_enabled: bool = False
+        self._video_stream_runtime_config: dict[str, Any] = {}
+        self._video_stream_runtime_state: dict[str, Any] = {
+            "enabled": False,
+            "last_event": "disabled",
+            "last_accepted_input_frame_id": None,
+            "last_input_timestamp_s": None,
+            "last_output_schedule_timestamps_s": [],
+            "last_error": None,
+        }
+        self._video_stream_thread: threading.Thread | None = None
+        self._video_stream_stop_event = threading.Event()
+        self._video_stream_input_event = threading.Event()
+        self._video_stream_lock = threading.Lock()
+        self._video_stream_pending_input: dict[str, Any] | None = None
+        self._video_stream_output_queue: list[dict[str, Any]] = []
+        self._video_stream_output_cursor: int = 0
+        self._video_stream_last_error: str | None = None
 
     def _log_spatial_debug(self, message: str, *args) -> None:
         if self._spatial_debug_enabled:
@@ -330,6 +349,291 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
     def get_video_debug_state(self) -> dict[str, Any]:
         return dict(self._video_debug_state)
+
+    def enable_video_stream_runtime(
+        self,
+        *,
+        target_output_fps: float | None = None,
+        drop_stale_inputs: bool = False,
+        max_input_age_s: float | None = None,
+    ) -> None:
+        if target_output_fps is not None and target_output_fps <= 0:
+            raise ValueError(f"target_output_fps must be > 0, got {target_output_fps}")
+        if max_input_age_s is not None and max_input_age_s < 0:
+            raise ValueError(f"max_input_age_s must be >= 0, got {max_input_age_s}")
+        if self._video_stream_thread is not None and self._video_stream_thread.is_alive():
+            raise RuntimeError("Cannot reconfigure video stream runtime while the worker thread is running.")
+
+        self._video_stream_runtime_enabled = True
+        self._video_stream_runtime_config = {
+            "target_output_fps": None if target_output_fps is None else float(target_output_fps),
+            "drop_stale_inputs": bool(drop_stale_inputs),
+            "max_input_age_s": None if max_input_age_s is None else float(max_input_age_s),
+        }
+        self._video_stream_runtime_state = {
+            "enabled": True,
+            "config": dict(self._video_stream_runtime_config),
+            "last_event": "enabled",
+            "last_accepted_input_frame_id": None,
+            "last_input_timestamp_s": None,
+            "last_output_schedule_timestamps_s": [],
+            "last_error": None,
+        }
+        self._video_stream_output_queue = []
+        self._video_stream_output_cursor = 0
+        self._video_stream_pending_input = None
+        self._video_stream_last_error = None
+        self._log_video_debug("stream runtime enabled config=%s", self._video_stream_runtime_config)
+
+    def disable_video_stream_runtime(self) -> None:
+        self.stop_video_stream_runtime()
+        self._video_stream_runtime_enabled = False
+        self._video_stream_runtime_config = {}
+        self._video_stream_runtime_state = {
+            "enabled": False,
+            "last_event": "disabled",
+            "last_accepted_input_frame_id": None,
+            "last_input_timestamp_s": None,
+            "last_output_schedule_timestamps_s": [],
+            "last_error": None,
+        }
+        self._video_stream_pending_input = None
+        self._video_stream_output_queue = []
+        self._video_stream_output_cursor = 0
+        self._video_stream_last_error = None
+
+    def get_video_stream_runtime_state(self) -> dict[str, Any]:
+        return dict(self._video_stream_runtime_state)
+
+    def start_video_stream_runtime(self) -> None:
+        if not self._video_stream_runtime_enabled:
+            raise RuntimeError("Video stream runtime is not enabled. Call enable_video_stream_runtime() first.")
+        if self._video_stream_thread is not None and self._video_stream_thread.is_alive():
+            return
+
+        self._video_stream_stop_event.clear()
+        self._video_stream_input_event.clear()
+        with self._video_stream_lock:
+            self._video_stream_pending_input = None
+            self._video_stream_output_queue = []
+            self._video_stream_output_cursor = 0
+            self._video_stream_last_error = None
+        self._log_video_debug("video stream runtime start cleared pending input/output state")
+
+        self._video_stream_thread = threading.Thread(
+            target=self._video_stream_worker_loop,
+            name="flux2-video-stream-runtime",
+            daemon=True,
+        )
+        self._video_stream_thread.start()
+        self._update_video_stream_runtime_state(last_event="thread_started")
+        self._log_video_debug(
+            "video stream runtime thread started target_output_fps=%s drop_stale_inputs=%s max_input_age_s=%s",
+            self._video_stream_runtime_config.get("target_output_fps"),
+            self._video_stream_runtime_config.get("drop_stale_inputs"),
+            self._video_stream_runtime_config.get("max_input_age_s"),
+        )
+
+    def stop_video_stream_runtime(self, *, timeout_s: float = 2.0) -> None:
+        if self._video_stream_thread is None:
+            with self._video_stream_lock:
+                self._video_stream_pending_input = None
+                self._video_stream_output_queue = []
+                self._video_stream_output_cursor = 0
+            self._update_video_stream_runtime_state(last_event="thread_stopped")
+            return
+
+        self._video_stream_stop_event.set()
+        self._video_stream_input_event.set()
+        thread = self._video_stream_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout_s)
+        if thread is not None and thread.is_alive():
+            self._update_video_stream_runtime_state(last_event="thread_stop_timeout")
+            self._log_video_debug("video stream runtime thread stop timeout after %.3fs", timeout_s)
+            raise RuntimeError(f"Video stream runtime thread did not stop within {timeout_s} seconds.")
+        with self._video_stream_lock:
+            self._video_stream_pending_input = None
+            self._video_stream_output_queue = []
+            self._video_stream_output_cursor = 0
+        self._video_stream_thread = None
+        self._video_stream_stop_event.clear()
+        self._video_stream_input_event.clear()
+        self._update_video_stream_runtime_state(last_event="thread_stopped")
+        self._log_video_debug("video stream runtime thread stopped")
+
+    def submit_video_stream_frame(
+        self,
+        image: PIL.Image.Image | np.ndarray | torch.Tensor,
+        *,
+        input_frame_id: int | None = None,
+        input_timestamp_s: float | None = None,
+        interpolation_exp: int = 1,
+        interpolation_output_type: str = "np",
+        return_generated_frame: bool = False,
+        seed: int = 0,
+        **pipe_kwargs,
+    ) -> None:
+        if not self._video_stream_runtime_enabled:
+            raise RuntimeError("Video stream runtime is not enabled. Call enable_video_stream_runtime() first.")
+        if self._video_stream_thread is None or not self._video_stream_thread.is_alive():
+            raise RuntimeError("Video stream runtime thread is not running. Call start_video_stream_runtime() first.")
+
+        payload = {
+            "image": image,
+            "input_frame_id": input_frame_id,
+            "input_timestamp_s": time.time() if input_timestamp_s is None else float(input_timestamp_s),
+            "interpolation_exp": int(interpolation_exp),
+            "interpolation_output_type": interpolation_output_type,
+            "return_generated_frame": bool(return_generated_frame),
+            "seed": int(seed),
+            "pipe_kwargs": dict(pipe_kwargs),
+        }
+        with self._video_stream_lock:
+            self._video_stream_pending_input = payload
+        self._video_stream_input_event.set()
+        self._update_video_stream_runtime_state(
+            last_event="input_submitted",
+            input_frame_id=input_frame_id,
+            input_timestamp_s=payload["input_timestamp_s"],
+        )
+        self._log_video_debug(
+            "stream input submitted frame_id=%s timestamp_s=%.6f interpolation_exp=%s output_type=%s return_generated=%s",
+            input_frame_id,
+            payload["input_timestamp_s"],
+            payload["interpolation_exp"],
+            payload["interpolation_output_type"],
+            payload["return_generated_frame"],
+        )
+
+    def poll_video_stream_output(
+        self,
+        *,
+        now_s: float | None = None,
+        consume: bool = True,
+    ) -> list[Any]:
+        now_s = time.time() if now_s is None else float(now_s)
+        due_outputs: list[Any] = []
+        with self._video_stream_lock:
+            cursor = self._video_stream_output_cursor
+            while cursor < len(self._video_stream_output_queue):
+                item = self._video_stream_output_queue[cursor]
+                if float(item["scheduled_time_s"]) > now_s:
+                    break
+                due_outputs.append(item["frame"])
+                cursor += 1
+
+            if consume:
+                self._video_stream_output_cursor = cursor
+
+            if consume and self._video_stream_output_cursor > 0:
+                self._video_stream_output_queue = self._video_stream_output_queue[self._video_stream_output_cursor :]
+                self._video_stream_output_cursor = 0
+
+        if due_outputs:
+            self._update_video_stream_runtime_state(last_event="output_polled")
+        self._log_video_debug(
+            "stream output poll due_count=%s remaining_count=%s consume=%s now_s=%.6f",
+            len(due_outputs),
+            len(self._video_stream_output_queue) - self._video_stream_output_cursor,
+            consume,
+            now_s,
+        )
+        return due_outputs
+
+    def _video_stream_worker_loop(self) -> None:
+        while not self._video_stream_stop_event.is_set():
+            self._video_stream_input_event.wait(timeout=0.05)
+            if self._video_stream_stop_event.is_set():
+                break
+
+            payload = None
+            with self._video_stream_lock:
+                if self._video_stream_pending_input is not None:
+                    payload = self._video_stream_pending_input
+                    self._video_stream_pending_input = None
+                self._video_stream_input_event.clear()
+
+            if payload is None:
+                continue
+            self._log_video_debug(
+                "worker dequeued input frame_id=%s timestamp_s=%.6f interpolation_exp=%s output_type=%s return_generated=%s",
+                payload["input_frame_id"],
+                payload["input_timestamp_s"],
+                payload["interpolation_exp"],
+                payload["interpolation_output_type"],
+                payload["return_generated_frame"],
+            )
+            try:
+                result = self.process_video_stream_frame(
+                    image=payload["image"],
+                    input_frame_id=payload["input_frame_id"],
+                    input_timestamp_s=payload["input_timestamp_s"],
+                    interpolation_exp=payload["interpolation_exp"],
+                    interpolation_output_type=payload["interpolation_output_type"],
+                    return_generated_frame=payload["return_generated_frame"],
+                    seed=payload["seed"],
+                    **payload["pipe_kwargs"],
+                )
+
+                if payload["return_generated_frame"]:
+                    frames, _generated_frame = result
+                else:
+                    frames = result
+
+                schedule = list(self._video_debug_state.get("output_schedule_timestamps_s", []))
+                if not frames:
+                    self._log_video_debug(
+                        "worker produced no frames frame_id=%s likely dropped before enqueue",
+                        payload["input_frame_id"],
+                    )
+                    continue
+                if len(schedule) != len(frames):
+                    schedule = self._build_video_output_schedule(
+                        frame_count=len(frames),
+                        schedule_start_s=time.time(),
+                    )
+
+                with self._video_stream_lock:
+                    self._video_stream_output_queue = [
+                        {"frame": frame, "scheduled_time_s": float(scheduled_time_s)}
+                        for frame, scheduled_time_s in zip(frames, schedule)
+                    ]
+                    self._video_stream_output_cursor = 0
+
+                self._update_video_stream_runtime_state(
+                    last_event="output_enqueued",
+                    output_schedule_timestamps_s=schedule,
+                    output_frame_count=len(frames),
+                )
+                self._log_video_debug(
+                    "worker enqueued output frame_id=%s frame_count=%s first_schedule_s=%s last_schedule_s=%s",
+                    payload["input_frame_id"],
+                    len(frames),
+                    schedule[0] if schedule else None,
+                    schedule[-1] if schedule else None,
+                )
+            except Exception as exc:
+                self._video_stream_last_error = repr(exc)
+                with self._video_stream_lock:
+                    self._video_stream_pending_input = None
+                    self._video_stream_output_queue = []
+                    self._video_stream_output_cursor = 0
+                self._video_debug_state.update(
+                    {
+                        "enabled": self._video_debug_enabled,
+                        "last_event": "video_stream_worker_error",
+                        "worker_error": self._video_stream_last_error,
+                    }
+                )
+                self._update_video_stream_runtime_state(
+                    last_event="worker_error",
+                    drop_reason=self._video_stream_last_error,
+                )
+                self._log_video_debug("video stream worker error: %s", self._video_stream_last_error)
+                break
+
+        self._video_stream_stop_event.set()
 
     def reset_spatial_consistency_state(self, *, reason: str = "manual") -> None:
         self.spatial_cache.clear()
@@ -950,6 +1254,109 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 "has_previous_video_output": False,
             }
         )
+        self._video_stream_runtime_state.update(
+            {
+                "last_event": "video_state_reset",
+                "last_accepted_input_frame_id": None,
+                "last_input_timestamp_s": None,
+                "last_output_schedule_timestamps_s": [],
+            }
+        )
+        with self._video_stream_lock:
+            self._video_stream_pending_input = None
+            self._video_stream_output_queue = []
+            self._video_stream_output_cursor = 0
+
+    def _should_drop_video_input(
+        self,
+        *,
+        input_frame_id: int | None,
+        input_timestamp_s: float | None,
+        now_s: float,
+    ) -> tuple[bool, str | None]:
+        if not self._video_stream_runtime_enabled:
+            return False, None
+
+        config = self._video_stream_runtime_config
+        if not config.get("drop_stale_inputs", False):
+            return False, None
+
+        last_frame_id = self._video_stream_runtime_state.get("last_accepted_input_frame_id")
+        if input_frame_id is not None and last_frame_id is not None and int(input_frame_id) <= int(last_frame_id):
+            self._log_video_debug(
+                "stream input drop decision reason=stale_frame_id frame_id=%s last_accepted_frame_id=%s",
+                input_frame_id,
+                last_frame_id,
+            )
+            return True, "stale_frame_id"
+
+        max_input_age_s = config.get("max_input_age_s")
+        if input_timestamp_s is not None and max_input_age_s is not None:
+            frame_age_s = max(0.0, float(now_s - input_timestamp_s))
+            if frame_age_s > float(max_input_age_s):
+                self._log_video_debug(
+                    "stream input drop decision reason=stale_input_age frame_id=%s frame_age_s=%.6f max_input_age_s=%s",
+                    input_frame_id,
+                    frame_age_s,
+                    max_input_age_s,
+                )
+                return True, "stale_input_age"
+
+        if input_frame_id is not None or input_timestamp_s is not None:
+            self._log_video_debug(
+                "stream input accepted frame_id=%s timestamp_s=%s now_s=%.6f",
+                input_frame_id,
+                input_timestamp_s,
+                now_s,
+            )
+        return False, None
+
+    def _build_video_output_schedule(
+        self,
+        *,
+        frame_count: int,
+        schedule_start_s: float,
+    ) -> list[float]:
+        if frame_count <= 0:
+            return []
+
+        target_output_fps = self._video_stream_runtime_config.get("target_output_fps")
+        if not self._video_stream_runtime_enabled or target_output_fps is None:
+            return [float(schedule_start_s)] * frame_count
+
+        frame_interval_s = 1.0 / float(target_output_fps)
+        return [float(schedule_start_s + (idx * frame_interval_s)) for idx in range(frame_count)]
+
+    def _update_video_stream_runtime_state(
+        self,
+        *,
+        last_event: str,
+        input_frame_id: int | None = None,
+        input_timestamp_s: float | None = None,
+        output_schedule_timestamps_s: list[float] | None = None,
+        output_frame_count: int | None = None,
+        drop_reason: str | None = None,
+    ) -> None:
+        state_update: dict[str, Any] = {
+            "enabled": self._video_stream_runtime_enabled,
+            "last_event": last_event,
+        }
+        if self._video_stream_runtime_enabled:
+            state_update["config"] = dict(self._video_stream_runtime_config)
+        if input_frame_id is not None:
+            state_update["last_accepted_input_frame_id"] = int(input_frame_id)
+        if input_timestamp_s is not None:
+            state_update["last_input_timestamp_s"] = float(input_timestamp_s)
+        if output_schedule_timestamps_s is not None:
+            state_update["last_output_schedule_timestamps_s"] = list(output_schedule_timestamps_s)
+        if output_frame_count is not None:
+            state_update["last_output_schedule_frame_count"] = int(output_frame_count)
+        if drop_reason is not None:
+            state_update["last_drop_reason"] = drop_reason
+        else:
+            state_update["last_drop_reason"] = None
+        state_update["last_error"] = self._video_stream_last_error
+        self._video_stream_runtime_state.update(state_update)
 
     def _frame_to_tensor(self, frame: PIL.Image.Image | np.ndarray | torch.Tensor) -> torch.Tensor:
         if isinstance(frame, PIL.Image.Image):
@@ -1168,6 +1575,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 "height": int(pipe_kwargs["height"]),
                 "width": int(pipe_kwargs["width"]),
                 "generated_frame_shape": tuple(current_frame.shape) if hasattr(current_frame, "shape") else None,
+                "dropped_input": False,
+                "stream_runtime_enabled": bool(self._video_stream_runtime_enabled),
             }
         )
         self._log_video_debug(
@@ -1182,6 +1591,104 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
         if return_generated_frame:
             return frames, current_frame
+        return frames
+
+    @torch.no_grad()
+    def process_video_stream_frame(
+        self,
+        image: PIL.Image.Image | np.ndarray | torch.Tensor,
+        *,
+        input_frame_id: int | None = None,
+        input_timestamp_s: float | None = None,
+        interpolation_exp: int = 1,
+        interpolation_output_type: str = "np",
+        return_generated_frame: bool = False,
+        seed: int = 0,
+        **pipe_kwargs,
+    ):
+        """
+        Stream-aware wrapper around ``process_video_frame``.
+
+        This method keeps frame dropping and output scheduling concerns separate from the
+        core single-frame processing path so callers can opt into realtime-style behavior
+        without changing the base image-to-image API.
+        """
+        now_s = time.time()
+        should_drop, drop_reason = self._should_drop_video_input(
+            input_frame_id=input_frame_id,
+            input_timestamp_s=input_timestamp_s,
+            now_s=now_s,
+        )
+        if should_drop:
+            self._update_video_stream_runtime_state(
+                last_event=f"dropped:{drop_reason}",
+                drop_reason=drop_reason,
+            )
+            self._video_debug_state.update(
+                {
+                    "enabled": self._video_debug_enabled,
+                    "last_event": f"video_frame_dropped:{drop_reason}",
+                    "dropped_input": True,
+                    "drop_reason": drop_reason,
+                    "input_frame_id": None if input_frame_id is None else int(input_frame_id),
+                    "input_timestamp_s": None if input_timestamp_s is None else float(input_timestamp_s),
+                    "output_schedule_timestamps_s": [],
+                }
+            )
+            self._log_video_debug(
+                "stream frame dropped reason=%s input_frame_id=%s input_timestamp_s=%s",
+                drop_reason,
+                input_frame_id,
+                input_timestamp_s,
+            )
+            if return_generated_frame:
+                return [], None
+            return []
+
+        result = self.process_video_frame(
+            image=image,
+            interpolation_exp=interpolation_exp,
+            interpolation_output_type=interpolation_output_type,
+            return_generated_frame=return_generated_frame,
+            seed=seed,
+            **pipe_kwargs,
+        )
+
+        if return_generated_frame:
+            frames, generated_frame = result
+        else:
+            frames = result
+            generated_frame = None
+
+        interpolation_frames_count = len(frames) if not isinstance(frames, torch.Tensor) else int(frames.shape[0])
+        output_schedule_timestamps_s = self._build_video_output_schedule(
+            frame_count=int(interpolation_frames_count),
+            schedule_start_s=time.time(),
+        )
+        self._update_video_stream_runtime_state(
+            last_event="frame_processed",
+            input_frame_id=input_frame_id,
+            input_timestamp_s=input_timestamp_s,
+            output_schedule_timestamps_s=output_schedule_timestamps_s,
+            output_frame_count=int(interpolation_frames_count),
+        )
+        self._video_debug_state.update(
+            {
+                "input_frame_id": None if input_frame_id is None else int(input_frame_id),
+                "input_timestamp_s": None if input_timestamp_s is None else float(input_timestamp_s),
+                "output_schedule_timestamps_s": output_schedule_timestamps_s,
+                "stream_runtime_enabled": bool(self._video_stream_runtime_enabled),
+            }
+        )
+        self._log_video_debug(
+            "stream frame processed input_frame_id=%s scheduled_frames=%s target_output_fps=%s",
+            input_frame_id,
+            len(output_schedule_timestamps_s),
+            self._video_stream_runtime_config.get("target_output_fps"),
+        )
+
+        if return_generated_frame:
+            return frames, generated_frame
         return frames
 
     def enable_compile(
