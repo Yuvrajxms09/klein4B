@@ -17,9 +17,10 @@ to a PIL image. Model loading, NVFP4 setup, compilation, warmup, and file writes
 are outside the measured interval. The script measures 20 prompts, then saves
 the images and ``benchmark.json`` to the Modal volume.
 
-- to run this script, you just need the klein4B repo's cuda-kernels branch and also use diffusers repo
+Clone the ``optimized-nvfp4-115ms`` branch and keep the Diffusers checkout next
+to the ``klein4B`` directory.
 
-run with : ``modal run modal_bench_inference_nvfp4.py``
+Run: ``modal run fastest_script_115ms.py``
 """
 
 
@@ -70,12 +71,12 @@ image = (
     .run_commands("pip install torchao==0.17.0")
     .run_commands("pip install mslk-cuda==1.1.0")
     .add_local_dir(
-        str(_workspace_root() / "klein4B"),
+        str(_workspace_root()),
         remote_path="/root/klein4B",
         copy=True,
     )
     .add_local_dir(
-        str(_workspace_root() / "diffusers"),
+        str(_workspace_root().parent / "diffusers"),
         remote_path="/root/diffusers",
         copy=True,
     )
