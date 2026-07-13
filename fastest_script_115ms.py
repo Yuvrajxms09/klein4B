@@ -15,7 +15,8 @@ Each timed request uses a fresh prompt and includes text encoding, image
 encoding, latent setup, all four denoising steps, image decoding, and conversion
 to a PIL image. Model loading, NVFP4 setup, compilation, warmup, and file writes
 are outside the measured interval. The script measures 20 prompts, then saves
-the images and ``benchmark.json`` to the Modal volume.
+the images and ``benchmark.json`` to the Modal volume. Prompt caching remains
+enabled for normal repeated-prompt use, but the benchmark prompts are unique.
 
 Clone the ``optimized-nvfp4-115ms`` branch and keep the Diffusers checkout next
 to the ``klein4B`` directory.
@@ -311,8 +312,7 @@ def benchmark(
     )
     pipe.set_progress_bar_config(disable=True)
     pipe = pipe.to("cuda")
-    pipe._cache_prompt = False
-    pipe._prompt_cache.clear()
+    pipe._cache_prompt = True
 
     text_encoder_report = _quantize_and_compile_text_encoder(pipe)
     replace_pipeline_vae_with_taef2(pipe, cache_dir=taef2_cache_dir)
@@ -373,7 +373,6 @@ def benchmark(
         prepared_image = prepared_image.pin_memory()
 
     def call_pipeline(prompt: str, *, callback_on_step_end=None):
-        pipe._prompt_cache.clear()
         return pipe(
             prompt=prompt,
             image=prepared_image,
@@ -478,7 +477,7 @@ def benchmark(
         "input_preprocessed_outside_timing": True,
         "prompt_embeds_precomputed_outside_timing": False,
         "noise_precomputed_outside_timing": False,
-        "prompt_cache_enabled": False,
+        "prompt_cache_enabled": True,
         "unique_prompt_count": len(prompt_list),
         "expected_full_compute_nvfp4_gemms": 436,
     }
