@@ -6,17 +6,11 @@ This is the reference 576x384, 4 step config. It uses:
 - The first 27 Qwen layers, which provide Klein's requested hidden states.
 - TAEF2 (faster encoder-decoder) instead of the original VAE, using channels-last layout.
 - Native attention.(tested flash and sage - got no speedup with nvfp4 quants)
-- ``torch.compile`` with static shapes and ``max-autotune`` for Qwen, the
-  transformer, and TAEF2 decode. TAEF2 encode uses
+- prompts are cached by default in klein4B repo, so it saves around 10ms in case of repeated prompts
+- ``torch.compile`` with static shapes and ``max-autotune`` for qwen, the
+  transformer, and TAEF2 decode, encode uses
   ``max-autotune-no-cudagraphs``.
 - Inductor's 1x1-convolution matmul and coordinate-descent tuning options.
-
-Each timed request includes text encoding, image
-encoding, latent setup, all four denoising steps, image decoding, and conversion
-to a PIL image. Model loading, NVFP4 setup, compilation, warmup, and file writes
-are outside the measured interval. The list contains 20 unique prompts followed
-by four repeats so cached-prompt timings are visible in the normal logs. Images
-and ``benchmark.json`` are saved to the Modal volume after timing.
 
 Clone the ``optimized-nvfp4-115ms`` branch and keep the Diffusers checkout next
 to the ``klein4B`` directory.
