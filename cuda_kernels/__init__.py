@@ -1,4 +1,8 @@
 import importlib
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def is_loaded() -> bool:
@@ -19,4 +23,6 @@ def torch_ops_namespace():
 
 
 def load_compiled_extension(module_name: str = "klein_cuda_ext") -> None:
+    logger.info("loading Klein CUDA extension module=%s", module_name)
     importlib.import_module(module_name)
+    logger.info("Klein CUDA extension loaded module=%s", module_name)

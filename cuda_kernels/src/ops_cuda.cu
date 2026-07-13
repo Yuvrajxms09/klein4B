@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <vector>
 #include <limits>
 
@@ -115,6 +116,94 @@ __global__ void k_qk_rms_norm(
     }
 }
 
+template <typename scalar_t>
+__device__ __forceinline__ float scalar_to_float(scalar_t x) {
+    return static_cast<float>(x);
+}
+
+template <>
+__device__ __forceinline__ float scalar_to_float<__nv_bfloat16>(__nv_bfloat16 x) {
+    return __bfloat162float(x);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t float_to_scalar(float x) {
+    return static_cast<scalar_t>(x);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 float_to_scalar<__nv_bfloat16>(float x) {
+    return __float2bfloat16(x);
+}
+
+// Fuses the two operations that previously forced three temporary layouts:
+// Q/K RMSNorm, RoPE, and the QKV view preparation. QKV is contiguous in
+// [sequence, heads, 3, head_dim] order and remains in its original dtype.
+template <typename scalar_t>
+__global__ void k_fused_qkv_rope_qk_norm(
+    scalar_t* qkv,
+    const float* qw,
+    const float* kw,
+    const float* cos_f,
+    const float* sin_f,
+    int seq,
+    int heads,
+    int hdim,
+    float eps) {
+    const int row = blockIdx.x;
+    const int total_rows = seq * heads;
+    if (row >= total_rows) return;
+
+    const int s = row / heads;
+    scalar_t* q = qkv + static_cast<size_t>(row) * 3 * hdim;
+    scalar_t* k = q + hdim;
+
+    __shared__ float sq[BLOCK_NORM];
+    __shared__ float sk[BLOCK_NORM];
+    float qsum = 0.0f;
+    float ksum = 0.0f;
+    for (int i = threadIdx.x; i < hdim; i += blockDim.x) {
+        const float qv = scalar_to_float(q[i]);
+        const float kv = scalar_to_float(k[i]);
+        qsum += qv * qv;
+        ksum += kv * kv;
+    }
+    sq[threadIdx.x] = qsum;
+    sk[threadIdx.x] = ksum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sq[threadIdx.x] += sq[threadIdx.x + stride];
+            sk[threadIdx.x] += sk[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    const float qrms = rsqrtf(sq[0] / static_cast<float>(hdim) + eps);
+    const float krms = rsqrtf(sk[0] / static_cast<float>(hdim) + eps);
+    for (int i = threadIdx.x; i < hdim; i += blockDim.x) {
+        q[i] = float_to_scalar<scalar_t>(scalar_to_float(q[i]) * qrms * qw[i]);
+        k[i] = float_to_scalar<scalar_t>(scalar_to_float(k[i]) * krms * kw[i]);
+    }
+    __syncthreads();
+
+    const int half_dim = hdim / 2;
+    for (int d = threadIdx.x; d < half_dim; d += blockDim.x) {
+        const int i = d * 2;
+        const int freq = s * hdim + i;
+        const float c = cos_f[freq];
+        const float sn = sin_f[freq];
+        const float q0 = scalar_to_float(q[i]);
+        const float q1 = scalar_to_float(q[i + 1]);
+        const float k0 = scalar_to_float(k[i]);
+        const float k1 = scalar_to_float(k[i + 1]);
+        q[i] = float_to_scalar<scalar_t>(q0 * c - q1 * sn);
+        q[i + 1] = float_to_scalar<scalar_t>(q1 * c + q0 * sn);
+        k[i] = float_to_scalar<scalar_t>(k0 * c - k1 * sn);
+        k[i + 1] = float_to_scalar<scalar_t>(k1 * c + k0 * sn);
+    }
+}
+
 __global__ void k_rope_2d_offset(
     float* x,
     const float* cos_f,
@@ -148,7 +237,8 @@ torch::Tensor silu_mul_cuda_(torch::Tensor gate, torch::Tensor up) {
     auto up_c = up.is_contiguous() ? up : up.contiguous();
     int n = static_cast<int>(gate_c.numel());
     int grid = (n + BLOCK_1D - 1) / BLOCK_1D;
-    k_silu_mul<<<grid, BLOCK_1D, 0, at::cuda::getDefaultCUDAStream()>>>(
+    auto stream = at::cuda::getCurrentCUDAStream(gate.get_device()).stream();
+    k_silu_mul<<<grid, BLOCK_1D, 0, stream>>>(
         gate_c.data_ptr<float>(),
         up_c.data_ptr<float>(),
         n);
@@ -166,7 +256,8 @@ torch::Tensor adaln_norm_cuda(torch::Tensor x, torch::Tensor shift, torch::Tenso
     int seq = static_cast<int>(x_c.size(0));
     int hid = static_cast<int>(x_c.size(1));
 
-    k_adaln_norm<<<seq, BLOCK_NORM, 0, at::cuda::getDefaultCUDAStream()>>>(
+    auto stream = at::cuda::getCurrentCUDAStream(x.get_device()).stream();
+    k_adaln_norm<<<seq, BLOCK_NORM, 0, stream>>>(
         out.data_ptr<float>(),
         x_c.data_ptr<float>(),
         shift_c.data_ptr<float>(),
@@ -187,7 +278,8 @@ std::vector<torch::Tensor> qk_rms_norm_cuda_(torch::Tensor q, torch::Tensor k, t
     int hdim = static_cast<int>(q_c.size(2));
     int grid = seq * heads;
 
-    k_qk_rms_norm<<<grid, BLOCK_NORM, 0, at::cuda::getDefaultCUDAStream()>>>(
+    auto stream = at::cuda::getCurrentCUDAStream(q.get_device()).stream();
+    k_qk_rms_norm<<<grid, BLOCK_NORM, 0, stream>>>(
         q_c.data_ptr<float>(),
         k_c.data_ptr<float>(),
         qw_c.data_ptr<float>(),
@@ -205,6 +297,38 @@ std::vector<torch::Tensor> qk_rms_norm_cuda_(torch::Tensor q, torch::Tensor k, t
     return {q, k};
 }
 
+void fused_qkv_rope_qk_norm_inplace_cuda_(
+    torch::Tensor qkv,
+    torch::Tensor qw,
+    torch::Tensor kw,
+    torch::Tensor cos,
+    torch::Tensor sin,
+    int64_t seq_offset,
+    int64_t seq_len) {
+    TORCH_CHECK(seq_offset == 0, "fused QKV op currently requires seq_offset == 0");
+    auto qkv_c = qkv.is_contiguous() ? qkv : qkv.contiguous();
+    auto qw_c = qw.is_contiguous() ? qw : qw.contiguous();
+    auto kw_c = kw.is_contiguous() ? kw : kw.contiguous();
+    auto cos_c = cos.is_contiguous() ? cos : cos.contiguous();
+    auto sin_c = sin.is_contiguous() ? sin : sin.contiguous();
+    const int seq = static_cast<int>(seq_len);
+    const int heads = static_cast<int>(qkv_c.size(1));
+    const int hdim = static_cast<int>(qkv_c.size(3));
+    const int grid = seq * heads;
+    auto stream = at::cuda::getCurrentCUDAStream(qkv_c.get_device()).stream();
+
+    if (qkv_c.scalar_type() == torch::kFloat32) {
+        k_fused_qkv_rope_qk_norm<float><<<grid, BLOCK_NORM, 0, stream>>>(
+            qkv_c.data_ptr<float>(), qw_c.data_ptr<float>(), kw_c.data_ptr<float>(),
+            cos_c.data_ptr<float>(), sin_c.data_ptr<float>(), seq, heads, hdim, 1e-6f);
+    } else {
+        k_fused_qkv_rope_qk_norm<__nv_bfloat16><<<grid, BLOCK_NORM, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(qkv_c.data_ptr<at::BFloat16>()),
+            qw_c.data_ptr<float>(), kw_c.data_ptr<float>(), cos_c.data_ptr<float>(),
+            sin_c.data_ptr<float>(), seq, heads, hdim, 1e-6f);
+    }
+}
+
 torch::Tensor rope_2d_offset_cuda_(torch::Tensor x, torch::Tensor cos, torch::Tensor sin, int64_t seq_offset, int64_t seq_len) {
     auto x_c = x.is_contiguous() ? x : x.contiguous();
     auto cos_c = cos.is_contiguous() ? cos : cos.contiguous();
@@ -216,7 +340,8 @@ torch::Tensor rope_2d_offset_cuda_(torch::Tensor x, torch::Tensor cos, torch::Te
     int total = seq * heads * (hdim / 2);
     int grid = (total + BLOCK_1D - 1) / BLOCK_1D;
 
-    k_rope_2d_offset<<<grid, BLOCK_1D, 0, at::cuda::getDefaultCUDAStream()>>>(
+    auto stream = at::cuda::getCurrentCUDAStream(x.get_device()).stream();
+    k_rope_2d_offset<<<grid, BLOCK_1D, 0, stream>>>(
         x_c.data_ptr<float>(),
         cos_c.data_ptr<float>(),
         sin_c.data_ptr<float>(),
@@ -317,25 +442,6 @@ __global__ void k_packed_attention(
     }
 }
 
-std::vector<torch::Tensor> fused_qkv_rope_qk_norm_cuda_(
-    torch::Tensor qkv,
-    torch::Tensor qw,
-    torch::Tensor kw,
-    torch::Tensor cos,
-    torch::Tensor sin,
-    int64_t seq_offset,
-    int64_t seq_len) {
-    auto qkv_c = qkv.is_contiguous() ? qkv : qkv.contiguous();
-    auto q = qkv_c.select(2, 0);
-    auto k = qkv_c.select(2, 1);
-    auto v = qkv_c.select(2, 2);
-
-    qk_rms_norm_cuda_(q, k, qw, kw, 1e-6);
-    rope_2d_offset_cuda_(q, cos, sin, seq_offset, seq_len);
-    rope_2d_offset_cuda_(k, cos, sin, seq_offset, seq_len);
-    return {q, k, v};
-}
-
 torch::Tensor packed_attention_cuda_(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale) {
     auto q_c = q.is_contiguous() ? q : q.contiguous();
     auto k_c = k.is_contiguous() ? k : k.contiguous();
@@ -352,7 +458,8 @@ torch::Tensor packed_attention_cuda_(torch::Tensor q, torch::Tensor k, torch::Te
     int hdim = static_cast<int>(q_c.size(2));
     int grid = seq * heads;
 
-    k_packed_attention<<<grid, ATTN_THREADS, 0, at::cuda::getDefaultCUDAStream()>>>(
+    auto stream = at::cuda::getCurrentCUDAStream(q.get_device()).stream();
+    k_packed_attention<<<grid, ATTN_THREADS, 0, stream>>>(
         q_c.data_ptr<float>(),
         k_c.data_ptr<float>(),
         v_c.data_ptr<float>(),

@@ -12,12 +12,17 @@ backend > transformer compile (after warmup).
 
 from __future__ import annotations
 
+import json
 import logging
+import statistics
 import torch
-from typing import Any
+from collections import Counter
 from types import MethodType
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 try:
     from einops import rearrange
@@ -26,6 +31,66 @@ except Exception:  # pragma: no cover - optional dependency in some envs
 
 
 logger = logging.getLogger(__name__)
+
+
+class _FixedKleinDenoiseLoop(torch.nn.Module):
+    """Static four-step Klein denoiser suitable for one torch.compile/CUDA graph."""
+
+    def __init__(self, transformer: torch.nn.Module, num_inference_steps: int):
+        super().__init__()
+        self.transformer = transformer
+        self.num_inference_steps = int(num_inference_steps)
+
+    def forward(
+        self,
+        latents: torch.Tensor,
+        image_latents: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        text_ids: torch.Tensor,
+        latent_image_ids: torch.Tensor,
+        timesteps: torch.Tensor,
+        scheduler_dts: torch.Tensor,
+        rotary_embeddings: tuple[Any, ...],
+    ) -> torch.Tensor:
+        latent_length = latents.shape[1]
+        for step in range(self.num_inference_steps):
+            latent_model_input = torch.cat((latents, image_latents), dim=1)
+            timestep = timesteps[step].expand(latents.shape[0]).to(latents.dtype)
+            noise_pred = self.transformer(
+                hidden_states=latent_model_input,
+                timestep=timestep / 1000,
+                guidance=None,
+                encoder_hidden_states=prompt_embeds,
+                txt_ids=text_ids,
+                img_ids=latent_image_ids,
+                joint_attention_kwargs=None,
+                rotary_embeddings=rotary_embeddings,
+                return_dict=False,
+            )[0]
+            noise_pred = noise_pred[:, :latent_length]
+            latents = (latents.to(torch.float32) + scheduler_dts[step] * noise_pred.to(torch.float32)).to(
+                noise_pred.dtype
+            )
+        return latents
+
+
+def enable_compiled_denoise_loop(
+    pipe: Any,
+    *,
+    num_inference_steps: int = 4,
+    mode: str = "max-autotune",
+) -> torch.nn.Module:
+    """Compile the complete fixed-step denoiser instead of compiling each transformer call separately."""
+    if num_inference_steps <= 0:
+        raise ValueError("num_inference_steps must be positive")
+    if getattr(pipe, "_cache_dit_mod", None) is not None:
+        raise ValueError("whole-loop compile and Cache-DiT are separate benchmark tracks")
+    loop = _FixedKleinDenoiseLoop(pipe.transformer, num_inference_steps).eval()
+    compiled = torch.compile(loop, mode=mode, fullgraph=False, dynamic=False)
+    pipe._compiled_denoise_loop = compiled
+    pipe._compiled_denoise_loop_steps = int(num_inference_steps)
+    logger.info("compiled resident Klein denoise loop steps=%d mode=%s", num_inference_steps, mode)
+    return compiled
 
 
 def latent_token_count_for_resolution(pipe: Any, height: int, width: int) -> int:
@@ -86,9 +151,9 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
         pass
 
     def _split_qkv_heads(qkv: torch.Tensor, num_heads: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        b, l, _ = qkv.shape
+        batch, sequence, _ = qkv.shape
         head_dim = qkv.shape[-1] // (3 * num_heads)
-        qkv = qkv.view(b, l, 3, num_heads, head_dim)
+        qkv = qkv.view(batch, sequence, 3, num_heads, head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         if not qkv.is_contiguous():
             qkv = qkv.contiguous()
@@ -243,7 +308,12 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         if not hasattr(ns, "fused_qkv_rope_qk_norm_"):
             return None
-        if not (qkv.is_cuda and qkv.dtype == torch.float32 and qkv.ndim == 4 and qkv.shape[2] == 3):
+        if not (
+            qkv.is_cuda
+            and qkv.dtype in (torch.float32, torch.bfloat16)
+            and qkv.ndim == 5
+            and qkv.shape[2] == 3
+        ):
             return None
         try:
             qw = module.query_norm.scale.to(dtype=torch.float32, copy=False)
@@ -258,8 +328,18 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
                 seq_offset,
                 qkv3.shape[0],
             )
-            return q, k, v
-        except Exception:
+            # The CUDA op works in sequence-major storage; expose the same
+            # [B, H, L, D] contract as Diffusers' attention fallback so BF16
+            # continues through exact SDPA instead of the FP32-only custom op.
+            return (
+                q.unsqueeze(0).permute(0, 2, 1, 3),
+                k.unsqueeze(0).permute(0, 2, 1, 3),
+                v.unsqueeze(0).permute(0, 2, 1, 3),
+            )
+        except Exception as exc:
+            if not getattr(transformer, "_klein_qkv_fallback_logged", False):
+                logger.warning("fused QKV norm/RoPE op fell back to PyTorch attention path: %s", exc)
+                setattr(transformer, "_klein_qkv_fallback_logged", True)
             return None
 
     def _fused_qkv_attention(
@@ -596,6 +676,13 @@ def apply_flux2_transformer_klein_ops(transformer: Any, *, verbose: bool = False
 
     if patched == 0:
         raise RuntimeError("No Flux2 blocks were patched; transformer structure did not match expectations")
+    setattr(transformer, "_klein_cuda_ops_patched", True)
+    logger.info(
+        "Klein CUDA block patches active: double_blocks=%d single_blocks=%d fused_qkv_norm_rope=%s",
+        len(getattr(transformer, "transformer_blocks", [])),
+        len(getattr(transformer, "single_transformer_blocks", [])),
+        _has_op("fused_qkv_rope_qk_norm_"),
+    )
     return transformer
 
 
@@ -706,7 +793,7 @@ class NunchakuKleinFullBackend:
             latents=None,
         )
 
-    def img2img(self, prompt: str, image: PIL.Image.Image, config: Any):
+    def img2img(self, prompt: str, image: Image.Image, config: Any):
         if self.pipe is None:
             raise RuntimeError("NunchakuKleinFullBackend requires an attached pipe")
         model = self._load_model()
@@ -767,7 +854,14 @@ class NunchakuKleinFullBackend:
             )[0]
             noise_pred = noise_pred[:, : latents.size(1)]
             latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-        latents = pipe._unpack_latents_with_ids(latents, latent_ids)
+        latent_height = int(config.height) // (pipe.vae_scale_factor * 2)
+        latent_width = int(config.width) // (pipe.vae_scale_factor * 2)
+        latents = pipe._unpack_latents_with_ids(
+            latents,
+            latent_ids,
+            latent_height,
+            latent_width,
+        )
         latents_bn_mean = pipe.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
         latents_bn_std = torch.sqrt(pipe.vae.bn.running_var.view(1, -1, 1, 1) + pipe.vae.config.batch_norm_eps).to(
             latents.device, latents.dtype
@@ -846,7 +940,8 @@ def enable_cache_dit(
     steps_computation_policy: str = "dynamic",
     enable_taylorseer: bool = True,
     taylorseer_order: int = 1,
-) -> None:
+    require_reuse_candidate: bool = False,
+) -> dict[str, Any]:
     """
     Enable cache-dit (DBCache) on the pipeline's transformer. Call once after
     loading (e.g. after from_pretrained).
@@ -876,6 +971,8 @@ def enable_cache_dit(
     if steps_mask is None:
         steps_mask = _default_steps_mask(num_inference_steps)
     steps_computation_mask = _parse_steps_mask(steps_mask, num_inference_steps)
+    if require_reuse_candidate and all(steps_computation_mask):
+        raise ValueError("cache reuse benchmark cannot use an all-compute steps mask")
 
     cache_config = DBCacheConfig(
         Fn_compute_blocks=cache_fn,
@@ -931,6 +1028,24 @@ def enable_cache_dit(
         params_modifiers=params_modifiers,
     )
     pipe._cache_dit_mod = cache_dit_mod
+    report = {
+        "num_inference_steps": num_inference_steps,
+        "steps_mask": "".join(str(v) for v in steps_computation_mask),
+        "forced_compute_steps": sum(steps_computation_mask),
+        "reuse_candidate_steps": len(steps_computation_mask) - sum(steps_computation_mask),
+        "cache_fn": cache_fn,
+        "cache_bn": cache_bn,
+        "residual_diff_threshold": residual_diff_threshold,
+        "single_block_rdt_scale": single_block_rdt_scale,
+        "max_warmup_steps": max_warmup_steps,
+        "max_cached_steps": max_cached_steps,
+        "max_continuous_cached_steps": max_continuous_cached_steps,
+        "steps_computation_policy": steps_computation_policy,
+        "enable_taylorseer": enable_taylorseer,
+        "taylorseer_order": taylorseer_order,
+    }
+    pipe._cache_dit_policy = report
+    return report
 
 
 # Aliases for apply_attention_backend (same names as flux-stream-editor).
@@ -942,16 +1057,17 @@ ATTENTION_BACKEND_ALIASES = {
     "flash_attention_3": "_flash_3",
     "default": "auto",
 }
-# Order tried when backend="auto": prefer flash3, then sage, then native.
-AUTO_ATTENTION_BACKEND_CANDIDATES = ("_flash_3", "sage", "native")
-
-
 def prepare_transformer_for_speed(
     pipe: Any,
     *,
     backend: str = "sage",
     fuse_qkv: bool = True,
     patch_klein_ops: bool = True,
+    direct_nvfp4_dispatch: bool = False,
+    fused_qkv_packing: bool = False,
+    nvfp4_gemm_backend: str = "torch-scaled-mm",
+    static_activation_scales: dict[str, torch.Tensor] | None = None,
+    allow_approximate_attention: bool = False,
 ) -> str | None:
     """
     Apply the stable hot-path configuration once, before cache-dit / compile.
@@ -970,44 +1086,620 @@ def prepare_transformer_for_speed(
             apply_flux2_transformer_klein_ops(pipe.transformer, verbose=False)
         except Exception as exc:
             logger.warning("klein CUDA block patch unavailable, using diffusers path: %s", exc)
-    if fuse_qkv and hasattr(pipe.transformer, "fuse_qkv_projections"):
+    if (
+        fuse_qkv
+        and hasattr(pipe.transformer, "fuse_qkv_projections")
+        and not getattr(pipe.transformer, "_is_qkv_fused", False)
+    ):
         try:
             logger.info("fusing transformer qkv projections")
             pipe.transformer.fuse_qkv_projections()
             setattr(pipe.transformer, "_is_qkv_fused", True)
         except Exception as exc:
             logger.warning("transformer qkv fusion failed, continuing without it: %s", exc)
-    try:
-        logger.info("fusing double-stream projection stacks")
-        fused_blocks = fuse_flux2_double_stream_attention_projections(pipe.transformer)
-        if fused_blocks == 0:
-            logger.info("no flux2 double-stream projections were fused")
-    except Exception as exc:
-        logger.warning("double-stream projection fusion failed, continuing without it: %s", exc)
+    elif fuse_qkv and getattr(pipe.transformer, "_is_qkv_fused", False):
+        logger.info("transformer qkv projections already fused; preserving existing weights")
+    if fuse_qkv:
+        try:
+            logger.info("fusing double-stream projection stacks")
+            fused_blocks = fuse_flux2_double_stream_attention_projections(pipe.transformer)
+            if fused_blocks == 0:
+                logger.info("no flux2 double-stream projections were fused")
+        except Exception as exc:
+            logger.warning("double-stream projection fusion failed, continuing without it: %s", exc)
+    if direct_nvfp4_dispatch:
+        report = patch_torchao_nvfp4_linear_dispatch(
+            pipe.transformer,
+            gemm_backend=nvfp4_gemm_backend,
+            static_activation_scales=static_activation_scales,
+        )
+        if report["patched"] == 0:
+            raise RuntimeError(f"direct TorchAO NVFP4 dispatch requested but no linears were patched: {report}")
+    if fused_qkv_packing:
+        from cuda_kernels.triton_qkv import install_fused_qkv_packing
+
+        report = install_fused_qkv_packing(pipe.transformer, validate=True)
+        if report["patched_double_blocks"] != 5 or report["patched_single_blocks"] != 20:
+            raise RuntimeError(f"fused QKV packing did not patch the complete 5+20 block topology: {report}")
     logger.info("selecting attention backend backend=%s", backend)
-    return apply_attention_backend(pipe, backend)
+    return apply_attention_backend(
+        pipe,
+        backend,
+        allow_approximate_attention=allow_approximate_attention,
+    )
 
 
 def _make_fused_linear_from_linears(linears: list[torch.nn.Linear]) -> torch.nn.Linear:
     if not linears:
         raise ValueError("expected at least one linear module")
     first = linears[0]
-    if any(l.in_features != first.in_features for l in linears):
+    if any(linear.in_features != first.in_features for linear in linears):
         raise ValueError("all fused linears must share input features")
-    if any(l.bias is not None for l in linears) and any(l.bias is None for l in linears):
+    if any(linear.bias is not None for linear in linears) and any(
+        linear.bias is None for linear in linears
+    ):
         raise ValueError("all fused linears must either all have bias or all omit bias")
     fused = torch.nn.Linear(
         first.in_features,
-        sum(l.out_features for l in linears),
+        sum(linear.out_features for linear in linears),
         bias=first.bias is not None,
         device=first.weight.device,
         dtype=first.weight.dtype,
     )
     with torch.no_grad():
-        fused.weight.copy_(torch.cat([l.weight.detach() for l in linears], dim=0))
+        fused.weight.copy_(torch.cat([linear.weight.detach() for linear in linears], dim=0))
         if fused.bias is not None:
-            fused.bias.copy_(torch.cat([l.bias.detach() for l in linears], dim=0))
+            fused.bias.copy_(torch.cat([linear.bias.detach() for linear in linears], dim=0))
     return fused
+
+
+def calibrate_torchao_nvfp4_activation_scales(
+    transformer: Any,
+    calibration_fn: Callable[[], None],
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    """Collect static NVFP4 activation scales from representative transformer calls."""
+    from torchao.prototype.mx_formats.nvfp4_tensor import (
+        NVFP4Tensor,
+        per_tensor_amax_to_scale,
+    )
+
+    modules = {
+        name: module
+        for name, module in transformer.named_modules()
+        if isinstance(module, torch.nn.Linear) and isinstance(module.weight, NVFP4Tensor)
+    }
+    if not modules:
+        raise RuntimeError("static NVFP4 calibration found no quantized linear modules")
+
+    maxima: dict[str, torch.Tensor] = {}
+    call_counts: Counter[str] = Counter()
+    handles = []
+
+    def make_hook(name: str):
+        def observe(_module: torch.nn.Module, args: tuple[Any, ...]) -> None:
+            if not args or not isinstance(args[0], torch.Tensor):
+                raise RuntimeError(f"NVFP4 calibration received invalid input for {name}")
+            observed = args[0].detach().abs().amax().to(torch.float32)
+            maxima[name] = (
+                observed if name not in maxima else torch.maximum(maxima[name], observed)
+            )
+            call_counts[name] += 1
+
+        return observe
+
+    try:
+        for name, module in modules.items():
+            handles.append(module.register_forward_pre_hook(make_hook(name)))
+        with torch.inference_mode():
+            calibration_fn()
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    missing = set(modules).difference(maxima)
+    if missing:
+        raise RuntimeError(
+            "static NVFP4 calibration did not execute every quantized linear: "
+            f"{sorted(missing)}"
+        )
+    scales = {
+        name: per_tensor_amax_to_scale(amax).detach()
+        for name, amax in maxima.items()
+    }
+    zero_or_invalid = [
+        name
+        for name, scale in scales.items()
+        if not bool(torch.isfinite(scale).all()) or not bool((scale > 0).all())
+    ]
+    if zero_or_invalid:
+        raise RuntimeError(
+            "static NVFP4 calibration produced invalid scales: "
+            f"{zero_or_invalid}"
+        )
+    amax_values = torch.stack(list(maxima.values()))
+    report = {
+        "module_count": len(modules),
+        "total_linear_calls": sum(call_counts.values()),
+        "minimum_calls_per_module": min(call_counts.values()),
+        "maximum_calls_per_module": max(call_counts.values()),
+        "minimum_amax": float(amax_values.min().item()),
+        "maximum_amax": float(amax_values.max().item()),
+    }
+    logger.info("static TorchAO NVFP4 activation calibration complete: %s", report)
+    return scales, report
+
+
+def _direct_torchao_nvfp4_linear_forward(self: torch.nn.Linear, input_tensor: torch.Tensor) -> torch.Tensor:
+    """TorchAO-equivalent NVFP4 linear without the Tensor-subclass dispatch layer."""
+    if self._klein_nvfp4_gemm_backend == "cutlass-sm120":
+        from cuda_kernels.sm120_nvfp4 import linear_forward
+
+        return linear_forward(self, input_tensor)
+    if self._klein_nvfp4_dynamic_activation_scale:
+        activation_scale = torch.max(torch.abs(input_tensor)).to(torch.float32) / 2688.0
+    else:
+        activation_scale = self._klein_nvfp4_activation_scale
+
+    input_2d = input_tensor.reshape(-1, input_tensor.shape[-1])
+    global_scale = activation_scale.reciprocal() if activation_scale is not None else None
+    activation_block_scales, activation_qdata = torch.ops.ao.mslk_quantize_nvfp4(
+        input_2d,
+        global_scale,
+    )
+
+    weight_scale = self._klein_nvfp4_weight_scale
+    if activation_scale is not None and weight_scale is not None:
+        output_scale = activation_scale * weight_scale
+    elif activation_scale is not None:
+        output_scale = activation_scale
+    else:
+        output_scale = weight_scale
+
+    add_bias_separately = (output_scale is not None or input_tensor.dtype == torch.float32) and self.bias is not None
+    if self._klein_nvfp4_gemm_backend == "flashinfer-cudnn":
+        if output_scale is None:
+            raise RuntimeError("FlashInfer cuDNN NVFP4 requires a global output scale")
+        from cuda_kernels.flashinfer_nvfp4 import flashinfer_cudnn_fp4_mm
+
+        result = flashinfer_cudnn_fp4_mm(
+            activation_qdata,
+            self._klein_nvfp4_weight_qdata_t,
+            activation_block_scales.view(torch.float8_e4m3fn),
+            self._klein_nvfp4_weight_block_scales.view(torch.float8_e4m3fn).t(),
+            output_scale.to(torch.float32),
+            input_tensor.dtype,
+            int(self.out_features),
+        )
+        output_scale = None  # FlashInfer applies alpha inside the GEMM.
+    else:
+        result = torch._scaled_mm(
+            activation_qdata.view(torch.float4_e2m1fn_x2),
+            self._klein_nvfp4_weight_qdata_t.view(torch.float4_e2m1fn_x2),
+            activation_block_scales.view(torch.float8_e4m3fn),
+            self._klein_nvfp4_weight_block_scales.view(torch.float8_e4m3fn),
+            bias=None if add_bias_separately else self.bias,
+            out_dtype=input_tensor.dtype,
+        )
+    if output_scale is not None:
+        result = result * output_scale.to(input_tensor.dtype)
+    if add_bias_separately:
+        result = result + self.bias.to(input_tensor.dtype)
+    return result.reshape(*input_tensor.shape[:-1], result.shape[-1])
+
+
+def patch_torchao_nvfp4_linear_dispatch(
+    transformer: Any,
+    *,
+    strict: bool = True,
+    validate: bool = True,
+    gemm_backend: str = "torch-scaled-mm",
+    static_activation_scales: dict[str, torch.Tensor] | None = None,
+) -> dict[str, Any]:
+    """
+    Replace TorchAO NVFP4 Tensor-subclass linear dispatch with the equivalent
+    raw-tensor MSLK quantize + scaled-mm path before torch.compile().
+
+    Packed weights and scale tables are borrowed directly from NVFP4Tensor.
+    No weight conversion, host transfer, or native-owned allocation is
+    performed.
+    """
+    if gemm_backend not in {"torch-scaled-mm", "flashinfer-cudnn", "cutlass-sm120"}:
+        raise ValueError(f"unsupported NVFP4 GEMM backend: {gemm_backend}")
+    if gemm_backend == "flashinfer-cudnn":
+        try:
+            import flashinfer
+        except Exception as exc:
+            raise RuntimeError("FlashInfer cuDNN backend requested but flashinfer is unavailable") from exc
+        cuda_version = torch.version.cuda or "0"
+        cudnn_version = torch.backends.cudnn.version() or 0
+        if int(cuda_version.split(".", maxsplit=1)[0]) < 13 or cudnn_version < 91500:
+            raise RuntimeError(
+                "FlashInfer cuDNN NVFP4 requires CUDA 13+ and cuDNN 9.15+: "
+                f"torch_cuda={cuda_version} cudnn={cudnn_version} flashinfer={flashinfer.__version__}"
+            )
+
+    try:
+        from torchao.prototype.mx_formats.kernels import mslk_quantize_nvfp4  # noqa: F401
+        from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor
+    except Exception as exc:
+        raise RuntimeError("TorchAO NVFP4 internals are unavailable") from exc
+    kernel_variants: dict[int, str] = {}
+    if gemm_backend == "cutlass-sm120":
+        if not hasattr(torch.ops, "klein_sm120") or not hasattr(torch.ops.klein_sm120, "nvfp4_gemm_out"):
+            raise RuntimeError("SM120 CUTLASS NVFP4 extension is not loaded")
+        if not validate:
+            raise ValueError("cutlass-sm120 requires setup validation and performance gating")
+        from cuda_kernels.sm120_nvfp4 import KERNEL_VARIANTS, prepare_linear, release_linear
+
+        kernel_variants = KERNEL_VARIANTS
+
+    patched = 0
+    candidates = 0
+    skipped: dict[str, int] = {}
+    validated_shapes: set[tuple[int, int, int, bool]] = set()
+    validation: list[dict[str, Any]] = []
+    shape_backend_choices: dict[tuple[int, int, int, bool], str] = {}
+    shape_kernel_variants: dict[tuple[int, int, int, bool], int] = {}
+    native_compile_probe: dict[str, Any] | None = None
+    native_compile_compatible: bool | None = None
+    production_row_counts: Counter[int] = Counter()
+    static_scale_names = set(static_activation_scales or {})
+
+    def skip(reason: str) -> None:
+        skipped[reason] = skipped.get(reason, 0) + 1
+
+    def production_rows(module_fqn: str) -> int:
+        if "single_transformer_blocks" in module_fqn:
+            return 2240
+        if module_fqn.startswith(
+            (
+                "time_guidance_embed.",
+                "double_stream_modulation_img.",
+                "double_stream_modulation_txt.",
+                "single_stream_modulation.",
+                "norm_out.linear",
+            )
+        ):
+            return 1
+        if module_fqn == "context_embedder":
+            return 512
+        if module_fqn in {"x_embedder", "proj_out"}:
+            return 1728
+        if module_fqn.startswith("transformer_blocks."):
+            if any(
+                fragment in module_fqn
+                for fragment in (
+                    "to_added_qkv",
+                    "add_q_proj",
+                    "add_k_proj",
+                    "add_v_proj",
+                    "to_add_out",
+                    "ff_context",
+                )
+            ):
+                return 512
+            return 1728
+        raise RuntimeError(
+            "unclassified Klein NVFP4 production shape for native SM120 dispatch: "
+            f"module={module_fqn}"
+        )
+
+    for module_fqn, module in transformer.named_modules():
+        if not isinstance(module, torch.nn.Linear) or not isinstance(module.weight, NVFP4Tensor):
+            continue
+        candidates += 1
+        weight = module.weight
+        quant_kwargs = weight.act_quant_kwargs
+        if quant_kwargs is None:
+            skip("weight_only")
+            continue
+        if weight.block_size != 16:
+            skip("block_size")
+            continue
+        if not weight.is_swizzled_scales:
+            skip("unblocked_scales")
+            continue
+        if not quant_kwargs.use_triton_kernel:
+            skip("non_mslk_activation_quantizer")
+            continue
+        if not weight.qdata.is_cuda or not weight.scale.is_cuda:
+            skip("non_cuda_weight")
+            continue
+        if weight.qdata.dtype != torch.uint8:
+            skip("qdata_dtype")
+            continue
+        if weight.scale.dtype != torch.float8_e4m3fn:
+            skip("scale_dtype")
+            continue
+        if not weight.qdata.is_contiguous() or not weight.scale.is_contiguous():
+            skip("non_contiguous_weight")
+            continue
+
+        buffers = {
+            "_klein_nvfp4_weight_qdata_t": weight.qdata.t(),
+            "_klein_nvfp4_weight_block_scales": weight.scale,
+            "_klein_nvfp4_weight_scale": weight.per_tensor_scale,
+            "_klein_nvfp4_activation_scale": (
+                static_activation_scales[module_fqn]
+                if static_activation_scales is not None
+                else weight.act_per_tensor_scale
+            ),
+        }
+        for name, tensor in buffers.items():
+            if name in module._buffers:
+                module._buffers[name] = tensor
+            else:
+                module.register_buffer(name, tensor, persistent=False)
+
+        module._klein_nvfp4_dynamic_activation_scale = (
+            False
+            if static_activation_scales is not None
+            else bool(quant_kwargs.use_dynamic_per_tensor_scale)
+        )
+        validation_rows = 128
+        if gemm_backend == "cutlass-sm120":
+            validation_rows = production_rows(module_fqn)
+            production_row_counts[validation_rows] += 1
+        shape_key = (validation_rows, module.in_features, module.out_features, module.bias is not None)
+        module._klein_nvfp4_gemm_backend = gemm_backend
+        if gemm_backend == "cutlass-sm120":
+            selected_for_shape = (
+                "torch-scaled-mm"
+                if native_compile_compatible is False or module.bias is not None
+                else shape_backend_choices.get(shape_key)
+            )
+            if selected_for_shape == "torch-scaled-mm":
+                module._klein_nvfp4_gemm_backend = selected_for_shape
+                shape_backend_choices.setdefault(shape_key, selected_for_shape)
+            else:
+                prepare_linear(module, weight)
+                if selected_for_shape == "cutlass-sm120":
+                    module._klein_sm120_kernel_variant = shape_kernel_variants[shape_key]
+        validate_shape = gemm_backend in {"flashinfer-cudnn", "cutlass-sm120"} or len(validated_shapes) < 3
+        if validate and shape_key not in validated_shapes and validate_shape:
+            generator = torch.Generator(device=weight.device).manual_seed(0)
+            sample = torch.randn(
+                (validation_rows, module.in_features),
+                generator=generator,
+                device=weight.device,
+                dtype=weight.orig_dtype,
+            )
+            with torch.inference_mode():
+                dynamic_reference = module(sample)
+                if static_activation_scales is not None:
+                    requested_backend = module._klein_nvfp4_gemm_backend
+                    module._klein_nvfp4_gemm_backend = "torch-scaled-mm"
+                    reference = _direct_torchao_nvfp4_linear_forward(module, sample)
+                    module._klein_nvfp4_gemm_backend = requested_backend
+                else:
+                    reference = dynamic_reference
+            static_vs_dynamic_max_abs = (
+                float((dynamic_reference - reference).abs().max().item())
+                if static_activation_scales is not None
+                else 0.0
+            )
+            max_abs = None
+            torchao_ms = None
+            torchao_samples_ms: list[float] = []
+            native_ms = None
+            native_speedup = None
+            selected_backend = module._klein_nvfp4_gemm_backend
+            selected_kernel_variant = None
+            kernel_variant_results: list[dict[str, Any]] = []
+            if gemm_backend == "cutlass-sm120":
+                def benchmark_call(callable_fn: Callable[[], torch.Tensor]) -> tuple[float, list[float]]:
+                    for _ in range(5):
+                        callable_fn()
+                    samples = []
+                    for _ in range(5):
+                        start = torch.cuda.Event(enable_timing=True)
+                        end = torch.cuda.Event(enable_timing=True)
+                        start.record()
+                        for _ in range(20):
+                            callable_fn()
+                        end.record()
+                        end.synchronize()
+                        samples.append(float(start.elapsed_time(end) / 20.0))
+                    return statistics.median(samples), samples
+
+                if static_activation_scales is not None:
+                    def torch_scaled_reference_call() -> torch.Tensor:
+                        active_backend = module._klein_nvfp4_gemm_backend
+                        module._klein_nvfp4_gemm_backend = "torch-scaled-mm"
+                        try:
+                            return _direct_torchao_nvfp4_linear_forward(module, sample)
+                        finally:
+                            module._klein_nvfp4_gemm_backend = active_backend
+
+                    torchao_benchmark_call = torch_scaled_reference_call
+                else:
+                    def dynamic_torchao_reference_call() -> torch.Tensor:
+                        return module(sample)
+
+                    torchao_benchmark_call = dynamic_torchao_reference_call
+                torchao_ms, torchao_samples_ms = benchmark_call(torchao_benchmark_call)
+                valid_variants: list[tuple[float, int, float]] = []
+                variants_to_test = (
+                    {} if native_compile_compatible is False or module.bias is not None else kernel_variants
+                )
+                for kernel_variant, tile in variants_to_test.items():
+                    module._klein_nvfp4_gemm_backend = "cutlass-sm120"
+                    module._klein_sm120_kernel_variant = kernel_variant
+                    try:
+                        with torch.inference_mode():
+                            direct = _direct_torchao_nvfp4_linear_forward(module, sample)
+                        variant_max_abs = float((reference - direct).abs().max().item())
+                        parity = bool(torch.allclose(reference, direct, rtol=1e-2, atol=1e-2))
+                        variant_ms, variant_samples_ms = benchmark_call(
+                            lambda: _direct_torchao_nvfp4_linear_forward(module, sample)
+                        )
+                        if parity:
+                            valid_variants.append((variant_ms, kernel_variant, variant_max_abs))
+                        kernel_variant_results.append(
+                            {
+                                "variant": kernel_variant,
+                                "tile": tile,
+                                "max_abs": variant_max_abs,
+                                "parity": parity,
+                                "ms": variant_ms,
+                                "samples_ms": variant_samples_ms,
+                                "error": None,
+                            }
+                        )
+                    except Exception as exc:
+                        kernel_variant_results.append(
+                            {
+                                "variant": kernel_variant,
+                                "tile": tile,
+                                "max_abs": None,
+                                "parity": False,
+                                "ms": None,
+                                "samples_ms": [],
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+                if valid_variants:
+                    native_ms, selected_kernel_variant, max_abs = min(valid_variants)
+                    native_speedup = torchao_ms / native_ms
+                selected_backend = "cutlass-sm120" if (
+                    native_ms is not None and native_ms <= torchao_ms * 0.95
+                ) else "torch-scaled-mm"
+                module._klein_nvfp4_gemm_backend = selected_backend
+                shape_backend_choices[shape_key] = selected_backend
+                if selected_backend == "cutlass-sm120":
+                    module._klein_sm120_kernel_variant = selected_kernel_variant
+                    if native_compile_probe is None:
+                        try:
+                            compiled_probe = torch.compile(
+                                lambda tensor: _direct_torchao_nvfp4_linear_forward(module, tensor),
+                                mode="reduce-overhead",
+                                fullgraph=True,
+                                dynamic=False,
+                            )
+                            with torch.inference_mode():
+                                probe_output = compiled_probe(sample).detach().clone()
+                                compiled_probe(sample)
+                            probe_max_abs = float((reference - probe_output).abs().max().item())
+                            probe_parity = bool(
+                                torch.allclose(reference, probe_output, rtol=1e-2, atol=1e-2)
+                            )
+                            if not probe_parity:
+                                raise RuntimeError(
+                                    f"compiled native parity failed, max_abs={probe_max_abs}"
+                                )
+                            native_compile_compatible = True
+                            native_compile_probe = {
+                                "accepted": True,
+                                "shape": shape_key,
+                                "max_abs": probe_max_abs,
+                                "error": None,
+                            }
+                            logger.info("SM120 compile probe accepted: %s", native_compile_probe)
+                        except Exception as exc:
+                            native_compile_compatible = False
+                            native_compile_probe = {
+                                "accepted": False,
+                                "shape": shape_key,
+                                "max_abs": None,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                            logger.warning(
+                                "SM120 compile probe rejected; retaining TorchAO: %s",
+                                native_compile_probe,
+                            )
+                            selected_backend = "torch-scaled-mm"
+                            selected_kernel_variant = None
+                            module._klein_nvfp4_gemm_backend = selected_backend
+                            shape_backend_choices[shape_key] = selected_backend
+                            release_linear(module)
+                    if selected_backend == "cutlass-sm120":
+                        shape_kernel_variants[shape_key] = selected_kernel_variant
+                else:
+                    release_linear(module)
+            else:
+                try:
+                    direct = _direct_torchao_nvfp4_linear_forward(module, sample)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "NVFP4 backend validation failed "
+                        f"backend={gemm_backend} shape={shape_key} "
+                        f"error={type(exc).__name__}: {exc}"
+                    ) from None
+                max_abs = float((reference - direct).abs().max().item())
+                if not torch.allclose(reference, direct, rtol=1e-2, atol=1e-2):
+                    raise RuntimeError(
+                        f"direct NVFP4 dispatch parity failed for shape={shape_key}, max_abs={max_abs}"
+                    )
+            validation.append(
+                {
+                    "shape": shape_key,
+                    "max_abs": max_abs,
+                    "static_vs_dynamic_max_abs": static_vs_dynamic_max_abs,
+                    "module": module_fqn,
+                    "torchao_ms": torchao_ms,
+                    "torchao_samples_ms": torchao_samples_ms,
+                    "native_ms": native_ms,
+                    "native_speedup": native_speedup,
+                    "selected_backend": selected_backend,
+                    "selected_kernel_variant": selected_kernel_variant,
+                    "kernel_variants": kernel_variant_results,
+                }
+            )
+            logger.info(
+                "NVFP4 shape selection shape=%s torchao_ms=%s native_ms=%s "
+                "backend=%s tile_variant=%s",
+                shape_key,
+                torchao_ms,
+                native_ms,
+                selected_backend,
+                selected_kernel_variant,
+            )
+            validated_shapes.add(shape_key)
+        module.forward = MethodType(_direct_torchao_nvfp4_linear_forward, module)
+        patched += 1
+
+    if static_activation_scales is not None:
+        missing = static_scale_names.difference(name for name, _ in transformer.named_modules())
+        if missing:
+            raise RuntimeError(
+                "static NVFP4 activation scales reference unknown modules: "
+                f"{sorted(missing)}"
+            )
+        if len(static_activation_scales) != patched:
+            raise RuntimeError(
+                "static NVFP4 activation scale coverage mismatch: "
+                f"scales={len(static_activation_scales)} patched={patched}"
+            )
+
+    report = {
+        "gemm_backend": gemm_backend,
+        "candidates": candidates,
+        "patched": patched,
+        "static_activation_scale_count": (
+            len(static_activation_scales) if static_activation_scales is not None else 0
+        ),
+        "skipped": skipped,
+        "validation": validation,
+        "shape_backend_choices": {str(key): value for key, value in shape_backend_choices.items()},
+        "shape_kernel_variants": {
+            str(key): {"variant": value, "tile": kernel_variants[value]}
+            for key, value in shape_kernel_variants.items()
+        },
+        "native_compile_probe": native_compile_probe,
+        "production_row_counts": dict(production_row_counts),
+        "selected_backend_counts": dict(
+            Counter(
+                getattr(module, "_klein_nvfp4_gemm_backend", "unpatched")
+                for module in transformer.modules()
+                if isinstance(module, torch.nn.Linear) and isinstance(module.weight, NVFP4Tensor)
+            )
+        ),
+    }
+    transformer._klein_nvfp4_dispatch_report = report
+    logger.info("direct TorchAO NVFP4 dispatch patch: %s", report)
+    if strict and patched != candidates:
+        raise RuntimeError(f"direct NVFP4 dispatch did not patch every candidate: {report}")
+    return report
 
 
 def fuse_flux2_double_stream_attention_projections(transformer: Any) -> int:
@@ -1043,13 +1735,259 @@ def fuse_flux2_double_stream_attention_projections(transformer: Any) -> int:
     return fused_blocks
 
 
-def apply_attention_backend(pipe: Any, backend: str = "sage") -> str | None:
+def _benchmark_attention_backends(
+    transformer: Any,
+    *,
+    allow_approximate_attention: bool,
+) -> tuple[str, dict[str, Any]]:
+    import flashinfer
+
+    from cuda_kernels.flashinfer_attention import (
+        FLASHINFER_ATTENTION_BACKEND,
+        FLASHINFER_FP16_REDUCTION_ATTENTION_BACKEND,
+        FLASHINFER_NVFP4_ATTENTION_BACKEND,
+        flashinfer_exact_attention,
+        flashinfer_fp16_reduction_attention,
+        flashinfer_nvfp4_attention,
+    )
+    from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+    sequence = 2240
+    heads = 24
+    head_dim = 128
+    device = next(transformer.parameters()).device
+    generator = torch.Generator(device=device).manual_seed(0)
+    query = torch.randn(
+        (1, sequence, heads, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    key = torch.randn(
+        query.shape,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    value = torch.randn(
+        query.shape,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    def benchmark_call(callable_fn: Callable[[], torch.Tensor]) -> tuple[float, list[float]]:
+        for _ in range(5):
+            callable_fn()
+        samples = []
+        for _ in range(5):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(20):
+                callable_fn()
+            end.record()
+            end.synchronize()
+            samples.append(float(start.elapsed_time(end) / 20.0))
+        return statistics.median(samples), samples
+
+    with torch.inference_mode():
+        reference = dispatch_attention_fn(query, key, value, backend="native").detach().clone()
+    results: list[dict[str, Any]] = []
+    valid: list[tuple[float, str]] = []
+    flashinfer_processor_types = {
+        "KleinFusedQKVPackingProcessor",
+        "KleinFusedSingleQKVPackingProcessor",
+    }
+    flashinfer_processor_count = sum(
+        1
+        for module in transformer.modules()
+        if getattr(module, "processor", None).__class__.__name__
+        in flashinfer_processor_types
+    )
+    candidate_calls: list[tuple[str, Callable[[], torch.Tensor]]] = [
+        ("native", lambda: dispatch_attention_fn(query, key, value, backend="native")),
+        ("_flash_3", lambda: dispatch_attention_fn(query, key, value, backend="_flash_3")),
+    ]
+    if flashinfer_processor_count == 25:
+        candidate_calls.append(
+            (
+                FLASHINFER_ATTENTION_BACKEND,
+                lambda: flashinfer_exact_attention(query, key, value),
+            )
+        )
+    if allow_approximate_attention and flashinfer_processor_count == 25:
+        candidate_calls.extend(
+            [
+                (
+                    FLASHINFER_FP16_REDUCTION_ATTENTION_BACKEND,
+                    lambda: flashinfer_fp16_reduction_attention(query, key, value),
+                ),
+                (
+                    FLASHINFER_NVFP4_ATTENTION_BACKEND,
+                    lambda: flashinfer_nvfp4_attention(query, key, value),
+                ),
+            ]
+        )
+
+    approximate_limits = {
+        FLASHINFER_FP16_REDUCTION_ATTENTION_BACKEND: (0.05, 0.995),
+        FLASHINFER_NVFP4_ATTENTION_BACKEND: (0.15, 0.98),
+    }
+    for candidate, callable_fn in candidate_calls:
+        try:
+            with torch.inference_mode():
+                output = callable_fn().detach().clone()
+            output_f32 = output.float()
+            reference_f32 = reference.float()
+            relative_l2 = float(
+                torch.linalg.vector_norm(output_f32 - reference_f32)
+                / torch.linalg.vector_norm(reference_f32).clamp_min(1e-12)
+            )
+            cosine = float(
+                torch.nn.functional.cosine_similarity(
+                    output_f32.flatten(), reference_f32.flatten(), dim=0
+                )
+            )
+            is_approximate = candidate in approximate_limits
+            relative_l2_limit, cosine_limit = approximate_limits.get(candidate, (0.01, 0.999))
+            parity = bool(
+                torch.isfinite(output_f32).all()
+                and relative_l2 <= relative_l2_limit
+                and cosine >= cosine_limit
+            )
+            median_ms, samples_ms = benchmark_call(callable_fn)
+            if parity:
+                valid.append((median_ms, candidate))
+            results.append(
+                {
+                    "backend": candidate,
+                    "median_ms": median_ms,
+                    "samples_ms": samples_ms,
+                    "relative_l2": relative_l2,
+                    "cosine": cosine,
+                    "parity": parity,
+                    "approximate": is_approximate,
+                    "relative_l2_limit": relative_l2_limit,
+                    "cosine_limit": cosine_limit,
+                    "error": None,
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "backend": candidate,
+                    "median_ms": None,
+                    "samples_ms": [],
+                    "relative_l2": None,
+                    "cosine": None,
+                    "parity": False,
+                    "approximate": candidate in approximate_limits,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    native_result = next(item for item in results if item["backend"] == "native")
+    if native_result["median_ms"] is None:
+        raise RuntimeError(f"native attention benchmark failed: {native_result}")
+    fastest_ms, fastest_backend = min(valid)
+    selected = (
+        fastest_backend
+        if fastest_backend != "native" and fastest_ms <= native_result["median_ms"] * 0.95
+        else "native"
+    )
+    compile_probe = None
+    flashinfer_backends = {
+        FLASHINFER_ATTENTION_BACKEND: flashinfer_exact_attention,
+        FLASHINFER_FP16_REDUCTION_ATTENTION_BACKEND: flashinfer_fp16_reduction_attention,
+        FLASHINFER_NVFP4_ATTENTION_BACKEND: flashinfer_nvfp4_attention,
+    }
+    if selected in flashinfer_backends:
+        try:
+            selected_attention_fn = flashinfer_backends[selected]
+            compiled = torch.compile(
+                selected_attention_fn,
+                mode="reduce-overhead",
+                fullgraph=True,
+                dynamic=False,
+            )
+            with torch.inference_mode():
+                compiled_output = compiled(query, key, value).detach().clone()
+                compiled(query, key, value)
+            compiled_f32 = compiled_output.float()
+            relative_l2 = float(
+                torch.linalg.vector_norm(compiled_f32 - reference.float())
+                / torch.linalg.vector_norm(reference.float()).clamp_min(1e-12)
+            )
+            cosine = float(
+                torch.nn.functional.cosine_similarity(
+                    compiled_f32.flatten(), reference.float().flatten(), dim=0
+                )
+            )
+            relative_l2_limit, cosine_limit = approximate_limits.get(selected, (0.01, 0.999))
+            if relative_l2 > relative_l2_limit or cosine < cosine_limit:
+                raise RuntimeError(
+                    f"compiled attention parity failed relative_l2={relative_l2} cosine={cosine}"
+                )
+            compile_probe = {
+                "accepted": True,
+                "relative_l2": relative_l2,
+                "cosine": cosine,
+                "error": None,
+            }
+        except Exception as exc:
+            selected = "native"
+            compile_probe = {
+                "accepted": False,
+                "relative_l2": None,
+                "cosine": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    report = {
+        "shape": [1, sequence, heads, head_dim],
+        "results": results,
+        "selected": selected,
+        "minimum_required_speedup": 1.05,
+        "allow_approximate_attention": allow_approximate_attention,
+        "flashinfer_processor_count": flashinfer_processor_count,
+        "flashinfer_version": str(getattr(flashinfer, "__version__", "unknown")),
+        "compile_probe": compile_probe,
+    }
+    transformer._klein_attention_selection_report = report
+    logger.info("attention backend selection: %s", report)
+    return selected, report
+
+
+def _set_flashinfer_attention_backend(transformer: Any, backend: str) -> int:
+    patched = 0
+    for module in transformer.modules():
+        processor = getattr(module, "processor", None)
+        if processor is not None and processor.__class__.__name__ in {
+            "KleinFusedQKVPackingProcessor",
+            "KleinFusedSingleQKVPackingProcessor",
+        }:
+            processor._attention_backend = backend
+            patched += 1
+    if patched != 25:
+        raise RuntimeError(f"expected 25 Klein attention processors, patched {patched}")
+    return patched
+
+
+def apply_attention_backend(
+    pipe: Any,
+    backend: str = "sage",
+    *,
+    allow_approximate_attention: bool = False,
+) -> str | None:
     """
     Set the transformer attention backend. Nothing is automatic: you must call this
     after loading the pipeline; installing flash-attn or sage alone is not enough.
 
     backend: "sage" | "native" | "_flash_3" | "fa3" (alias for _flash_3) | "auto".
-    - "auto": try _flash_3, then sage, then native; use first that succeeds.
+    - "auto": benchmark backends at Klein's production attention shape and
+      select a numerically valid candidate only when it is at least 5% faster.
+      Approximate candidates participate only when explicitly allowed.
     - Otherwise set the given backend (after resolving aliases).
 
     Returns the backend name that was set, or None if the transformer does not
@@ -1058,15 +1996,31 @@ def apply_attention_backend(pipe: Any, backend: str = "sage") -> str | None:
     if not hasattr(pipe.transformer, "set_attention_backend"):
         return None
     resolved = (backend or "").strip().lower()
+    if resolved in {"cudnn", "cudnn-sdpa", "cudnn_attention"}:
+        try:
+            torch.backends.cuda.enable_cudnn_sdp(True)
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            torch.backends.cuda.enable_math_sdp(False)
+            pipe.transformer.set_attention_backend("native")
+            logger.info("forced exact cuDNN SDPA attention backend")
+            return "cudnn-sdpa"
+        except Exception as exc:
+            logger.warning("cuDNN SDPA attention backend unavailable: %s", exc)
+            return None
     resolved = ATTENTION_BACKEND_ALIASES.get(resolved, resolved)
     if resolved == "auto":
-        for candidate in AUTO_ATTENTION_BACKEND_CANDIDATES:
-            try:
-                pipe.transformer.set_attention_backend(candidate)
-                return candidate
-            except Exception:
-                continue
-        return None
+        selected, report = _benchmark_attention_backends(
+            pipe.transformer,
+            allow_approximate_attention=allow_approximate_attention,
+        )
+        if selected.startswith("flashinfer-"):
+            patched = _set_flashinfer_attention_backend(pipe.transformer, selected)
+            report["patched_processors"] = patched
+        else:
+            pipe.transformer.set_attention_backend(selected)
+        print(f"attention_backend_selection={json.dumps(report, sort_keys=True)}")
+        return selected
     try:
         pipe.transformer.set_attention_backend(resolved)
         return resolved

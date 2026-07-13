@@ -232,6 +232,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         # (latent_h, latent_w, ...), and (prompt, num_images_per_prompt, max_seq_len, text_encoder_layers).
         self._timesteps_cache: dict[tuple[int, int, str], tuple[torch.Tensor, int]] = {}
         self._image_latent_ids_cache: dict[tuple[tuple[tuple[int, int], ...], str], torch.Tensor] = {}
+        self._latent_ids_cache: dict[tuple[int, int, int, str], torch.Tensor] = {}
+        self._rotary_embeddings_cache: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+        self._vae_bn_constants_cache: dict[tuple[str, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
         self._prompt_cache: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor]] = {}
 
         # Fast preprocess and H2D: default on for inference.
@@ -250,7 +253,14 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self._last_inference_profile: dict[str, float] | None = None
         self._cuda_denoiser: Callable[..., torch.Tensor] | None = None
         self._cuda_denoiser_name: str | None = None
+        self._compiled_denoise_loop: Callable[..., torch.Tensor] | None = None
+        self._compiled_denoise_loop_steps: int | None = None
+        self._denoiser_compute_mask: tuple[bool, ...] | None = None
         self._klein_c_full_backend: Any | None = None
+        # Diffusers resolves this by walking every component to support CPU
+        # offload hooks. Normal Klein inference keeps every component on CUDA,
+        # so retain the resolved device until a later `.to(...)` invalidates it.
+        self._klein_execution_device: torch.device | None = None
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -292,8 +302,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         input_ids = torch.cat(all_input_ids, dim=0).to(device)
         attention_mask = torch.cat(all_attention_masks, dim=0).to(device)
 
-        # Forward pass through the model
-        output = text_encoder(
+        # Klein consumes intermediate decoder states only. Calling the base
+        # model avoids the unused causal-LM vocabulary projection.
+        encoder = getattr(text_encoder, "model", text_encoder)
+        output = encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
@@ -322,9 +334,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             t = torch.arange(1) if t_coord is None else t_coord[i]
             h = torch.arange(1)
             w = torch.arange(1)
-            l = torch.arange(L)
+            layer = torch.arange(L)
 
-            coords = torch.cartesian_prod(t, h, w, l)
+            coords = torch.cartesian_prod(t, h, w, layer)
             out_ids.append(coords)
 
         return torch.stack(out_ids)
@@ -352,10 +364,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         t = torch.arange(1)  # [0] - time dimension
         h = torch.arange(height)
         w = torch.arange(width)
-        l = torch.arange(1)  # [0] - layer dimension
+        layer = torch.arange(1)  # [0] - layer dimension
 
         # Create position IDs: (H*W, 4)
-        latent_ids = torch.cartesian_prod(t, h, w, l)
+        latent_ids = torch.cartesian_prod(t, h, w, layer)
 
         # Expand to batch: (B, H*W, 4)
         latent_ids = latent_ids.unsqueeze(0).expand(batch_size, -1, -1)
@@ -445,7 +457,12 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
     @staticmethod
     # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline._unpack_latents_with_ids
-    def _unpack_latents_with_ids(x: torch.Tensor, x_ids: torch.Tensor) -> list[torch.Tensor]:
+    def _unpack_latents_with_ids(
+        x: torch.Tensor,
+        x_ids: torch.Tensor,
+        height: int | None = None,
+        width: int | None = None,
+    ) -> list[torch.Tensor]:
         """
         using position ids to scatter tokens into place
         """
@@ -455,8 +472,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             h_ids = pos[:, 1].to(torch.int64)
             w_ids = pos[:, 2].to(torch.int64)
 
-            h = torch.max(h_ids) + 1
-            w = torch.max(w_ids) + 1
+            h = height if height is not None else torch.max(h_ids) + 1
+            w = width if width is not None else torch.max(w_ids) + 1
 
             flat_ids = h_ids * w + w_ids
 
@@ -557,8 +574,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         image_latents = retrieve_latents(self.vae.encode(image), generator=generator, sample_mode="argmax")
         image_latents = self._patchify_latents(image_latents)
 
-        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(image_latents.device, image_latents.dtype)
-        latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps)
+        latents_bn_mean, latents_bn_std = self._get_vae_bn_constants(image_latents)
         image_latents = (image_latents - latents_bn_mean) / latents_bn_std
 
         return image_latents
@@ -591,8 +607,13 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         else:
             latents = latents.to(device=device, dtype=dtype)
 
-        latent_ids = self._prepare_latent_ids(latents)
-        latent_ids = latent_ids.to(device)
+        latent_ids_key = (batch_size, height // 2, width // 2, str(device))
+        if self._cache_image_latent_ids and latent_ids_key in self._latent_ids_cache:
+            latent_ids = self._latent_ids_cache[latent_ids_key]
+        else:
+            latent_ids = self._prepare_latent_ids(latents).to(device)
+            if self._cache_image_latent_ids:
+                self._latent_ids_cache[latent_ids_key] = latent_ids
 
         latents = self._pack_latents(latents)  # [B, C, H, W] -> [B, H*W, C]
         return latents, latent_ids
@@ -617,6 +638,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 except Exception:
                     logger.warning("vae encoder compiled path failed, fallback to eager")
                     self._vae_encode_fn = None
+                    # A failed CUDA Graph replay can leave graph-owned cached
+                    # tensors invalid. Rebuild constants eagerly for fallback.
+                    self._vae_bn_constants_cache.clear()
                     image_latent = self._encode_vae_image(image=image, generator=generator)
             else:
                 image_latent = self._encode_vae_image(image=image, generator=generator)
@@ -634,7 +658,15 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 self._image_latent_ids_cache[cache_key] = image_latent_ids
             image_latent_ids = image_latent_ids.repeat(batch_size, 1, 1)
 
-        # Pack each latent and concatenate
+        # The normal img2img path has one reference image. Preserve its batch
+        # layout without a squeeze/cat/unsqueeze round trip.
+        if len(image_latents) == 1:
+            image_latents = self._pack_latents(image_latents[0])
+            if batch_size != 1:
+                image_latents = image_latents.repeat(batch_size, 1, 1)
+            return image_latents, image_latent_ids
+
+        # Pack each latent and concatenate for multi-reference conditioning.
         packed_latents = []
         for latent in image_latents:
             # latent: (1, 128, 32, 32)
@@ -672,7 +704,111 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         """Clear timesteps, image latent IDs, and prompt caches."""
         self._timesteps_cache.clear()
         self._image_latent_ids_cache.clear()
+        self._latent_ids_cache.clear()
+        self._rotary_embeddings_cache.clear()
+        self._vae_bn_constants_cache.clear()
         self._prompt_cache.clear()
+
+    def configure_denoiser_step_reuse(self, compute_mask: tuple[bool, ...] | None) -> None:
+        """Configure the fixed four-step prediction-extrapolation path."""
+        if compute_mask is None:
+            self._denoiser_compute_mask = None
+            return
+        normalized = tuple(bool(value) for value in compute_mask)
+        if normalized != (True, True, False, False):
+            raise ValueError(
+                "Klein denoiser prediction reuse currently supports only the four-step 1100 mask"
+            )
+        self._denoiser_compute_mask = normalized
+        logger.info("configured denoiser prediction reuse compute_mask=1100 mode=linear")
+
+    @torch.compiler.disable
+    def _get_vae_bn_constants(self, ref: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (str(ref.device), ref.dtype)
+        cached = self._vae_bn_constants_cache.get(key)
+        if cached is not None:
+            return cached
+        mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(ref.device, ref.dtype).detach().clone()
+        std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
+            ref.device,
+            ref.dtype,
+        ).detach().clone()
+        cached = (mean, std)
+        self._vae_bn_constants_cache[key] = cached
+        logger.info("cached resident VAE BN constants dtype=%s device=%s", ref.dtype, ref.device)
+        return cached
+
+    def _get_rotary_embeddings_cached(
+        self,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
+        """Keep fixed-shape Flux2 RoPE tensors resident across steps and requests."""
+        img_ids_2d = img_ids[0] if img_ids.ndim == 3 else img_ids
+        txt_ids_2d = txt_ids[0] if txt_ids.ndim == 3 else txt_ids
+        key = (
+            tuple(img_ids_2d.shape),
+            tuple(txt_ids_2d.shape),
+            str(img_ids_2d.device),
+            img_ids_2d.dtype,
+            txt_ids_2d.dtype,
+        )
+        cached = self._rotary_embeddings_cache.get(key)
+        if cached is not None:
+            return cached
+
+        transformer = getattr(self.transformer, "_orig_mod", self.transformer)
+        image_rotary_emb = transformer.pos_embed(img_ids_2d)
+        text_rotary_emb = transformer.pos_embed(txt_ids_2d)
+        concat_rotary_emb = (
+            torch.cat([text_rotary_emb[0], image_rotary_emb[0]], dim=0),
+            torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
+        )
+        cached = (image_rotary_emb, text_rotary_emb, concat_rotary_emb)
+        self._rotary_embeddings_cache[key] = cached
+        logger.info(
+            "cached resident RoPE tensors image_tokens=%d text_tokens=%d device=%s",
+            img_ids_2d.shape[0],
+            txt_ids_2d.shape[0],
+            img_ids_2d.device,
+        )
+        return cached
+
+    @property
+    def _execution_device(self) -> torch.device:
+        """Cache the normal CUDA device without changing offload semantics."""
+        cached = getattr(self, "_klein_execution_device", None)
+        if cached is not None:
+            return cached
+
+        device = super()._execution_device
+        # Accelerate and group-offload hooks may change execution device between
+        # calls, so retain Diffusers' dynamic resolution whenever they exist.
+        try:
+            from diffusers.hooks.group_offloading import _is_group_offload_enabled
+        except Exception:
+            _is_group_offload_enabled = None
+        for component in self.components.values():
+            if not isinstance(component, torch.nn.Module):
+                continue
+            if hasattr(component, "_hf_hook") or (
+                _is_group_offload_enabled is not None and _is_group_offload_enabled(component)
+            ):
+                return device
+
+        self._klein_execution_device = device
+        logger.info("cached Klein execution device=%s (no offload hooks detected)", device)
+        return device
+
+    def to(self, *args, **kwargs):
+        self._klein_execution_device = None
+        result = super().to(*args, **kwargs)
+        self._klein_execution_device = None
+        return result
 
     def enable_compile(
         self,
@@ -770,6 +906,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         img_ids: torch.Tensor,
         joint_attention_kwargs: dict[str, Any] | None,
         context: str,
+        rotary_embeddings: tuple[Any, ...] | None = None,
     ) -> torch.Tensor:
         use_cuda_denoiser = (
             self._cuda_denoiser is not None
@@ -801,6 +938,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 txt_ids=txt_ids,
                 img_ids=img_ids,
                 joint_attention_kwargs=joint_attention_kwargs,
+                rotary_embeddings=rotary_embeddings,
                 return_dict=False,
             )[0]
 
@@ -836,10 +974,44 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         ):
             latent_model_input = torch.empty(buffer_shape, device=device, dtype=dtype)
             self._denoiser_input_buffer = latent_model_input
+            logger.info(
+                "allocated persistent denoiser input buffer shape=%s dtype=%s device=%s",
+                buffer_shape,
+                dtype,
+                device,
+            )
 
         latent_model_input[:, : latents.shape[1]].copy_(latents)
-        latent_model_input[:, latents.shape[1] :].copy_(image_latents)
 
+        # The image-conditioning tokens are invariant for all denoising steps
+        # in one request. Populate the persistent suffix once instead of
+        # re-copying it before every transformer forward.
+        static_suffix_key = (
+            getattr(self, "_denoiser_request_generation", 0),
+            tuple(image_latents.shape),
+            image_latents.dtype,
+            image_latents.device,
+        )
+        if getattr(self, "_denoiser_static_suffix_key", None) != static_suffix_key:
+            latent_model_input[:, latents.shape[1] :].copy_(image_latents)
+            self._denoiser_static_suffix_key = static_suffix_key
+
+        latent_image_ids = self._prepare_denoiser_ids(
+            latent_ids=latent_ids,
+            image_latent_ids=image_latent_ids,
+            batch=batch,
+            total_seq=total_seq,
+        )
+        return latent_model_input, latent_image_ids
+
+    def _prepare_denoiser_ids(
+        self,
+        *,
+        latent_ids: torch.Tensor,
+        image_latent_ids: torch.Tensor,
+        batch: int,
+        total_seq: int,
+    ) -> torch.Tensor:
         latent_image_ids = getattr(self, "_denoiser_image_ids_buffer", None)
         id_shape = (batch, total_seq, latent_ids.shape[-1])
         if (
@@ -850,10 +1022,25 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         ):
             latent_image_ids = torch.empty(id_shape, device=latent_ids.device, dtype=latent_ids.dtype)
             self._denoiser_image_ids_buffer = latent_image_ids
+            logger.info(
+                "allocated persistent denoiser ID buffer shape=%s dtype=%s device=%s",
+                id_shape,
+                latent_ids.dtype,
+                latent_ids.device,
+            )
 
-        latent_image_ids[:, : latent_ids.shape[1]].copy_(latent_ids)
-        latent_image_ids[:, latent_ids.shape[1] :].copy_(image_latent_ids)
-        return latent_model_input, latent_image_ids
+        static_ids_key = (
+            getattr(self, "_denoiser_request_generation", 0),
+            tuple(latent_ids.shape),
+            tuple(image_latent_ids.shape),
+            latent_ids.dtype,
+            latent_ids.device,
+        )
+        if getattr(self, "_denoiser_static_ids_key", None) != static_ids_key:
+            latent_image_ids[:, : latent_ids.shape[1]].copy_(latent_ids)
+            latent_image_ids[:, latent_ids.shape[1] :].copy_(image_latent_ids)
+            self._denoiser_static_ids_key = static_ids_key
+        return latent_image_ids
 
     def _run_full_backend_img2img(
         self,
@@ -979,6 +1166,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         max_sequence_length: int = 512,
         text_encoder_out_layers: tuple[int] = (9, 18, 27),
         profile: bool | None = None,
+        image_latents: torch.Tensor | None = None,
+        image_latent_ids: torch.Tensor | None = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -990,6 +1179,11 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 or tensors, the expected shape should be `(B, C, H, W)` or `(C, H, W)`. If it is a numpy array or a
                 list of arrays, the expected shape should be `(B, H, W, C)` or `(H, W, C)` It can also accept image
                 latents as `image`, but if passing latents directly it is not encoded again.
+            image_latents (`torch.Tensor`, *optional*):
+                Precomputed packed image-conditioning latents with shape `[B, S, C]`. Must be
+                provided together with `image_latent_ids` and instead of `image`.
+            image_latent_ids (`torch.Tensor`, *optional*):
+                Position IDs corresponding to `image_latents`, with matching batch and sequence dimensions.
             prompt (`str` or `List[str]`, *optional*):
                 The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
                 instead.
@@ -1069,6 +1263,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
             guidance_scale=guidance_scale,
         )
+        if (image_latents is None) != (image_latent_ids is None):
+            raise ValueError("`image_latents` and `image_latent_ids` must be provided together")
+        if image is not None and image_latents is not None:
+            raise ValueError("Pass either `image` or precomputed `image_latents`, not both")
 
         self._guidance_scale = guidance_scale
         self._attention_kwargs = attention_kwargs
@@ -1167,25 +1365,37 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         condition_images = None
         if image is not None:
             for img in image:
-                self.image_processor.check_image_input(img)
+                if torch.is_tensor(img):
+                    if img.ndim != 4:
+                        raise ValueError(f"Expected a preprocessed NCHW image tensor, got shape {tuple(img.shape)}")
+                else:
+                    self.image_processor.check_image_input(img)
 
             condition_images = []
             for img in image:
-                image_width, image_height = img.size
-                if image_width * image_height > 1024 * 1024:
-                    img = self.image_processor._resize_to_target_area(img, 1024 * 1024)
-                    image_width, image_height = img.size
-
-                multiple_of = self.vae_scale_factor * 2
-                image_width = (image_width // multiple_of) * multiple_of
-                image_height = (image_height // multiple_of) * multiple_of
-                if self._use_fast_preprocess:
-                    condition_images.append(
-                        self._preprocess_image_fast(img, height=image_height, width=image_width, resize_mode="crop")
-                    )
-                else:
-                    img = self.image_processor.preprocess(img, height=image_height, width=image_width, resize_mode="crop")
+                if torch.is_tensor(img):
+                    if img.ndim != 4:
+                        raise ValueError(f"Expected a preprocessed NCHW image tensor, got shape {tuple(img.shape)}")
+                    image_height, image_width = img.shape[-2:]
                     condition_images.append(img)
+                else:
+                    image_width, image_height = img.size
+                    if image_width * image_height > 1024 * 1024:
+                        img = self.image_processor._resize_to_target_area(img, 1024 * 1024)
+                        image_width, image_height = img.size
+
+                    multiple_of = self.vae_scale_factor * 2
+                    image_width = (image_width // multiple_of) * multiple_of
+                    image_height = (image_height // multiple_of) * multiple_of
+                    if self._use_fast_preprocess:
+                        condition_images.append(
+                            self._preprocess_image_fast(img, height=image_height, width=image_width, resize_mode="crop")
+                        )
+                    else:
+                        img = self.image_processor.preprocess(
+                            img, height=image_height, width=image_width, resize_mode="crop"
+                        )
+                        condition_images.append(img)
                 height = height or image_height
                 width = width or image_width
 
@@ -1205,8 +1415,6 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             latents=latents,
         )
 
-        image_latents = None
-        image_latent_ids = None
         if condition_images is not None:
             if profile_inference:
                 _sync_accelerator(device)
@@ -1224,6 +1432,34 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             if profile_inference:
                 _sync_accelerator(device)
                 vae_encode_s += time.perf_counter() - _t0
+        elif image_latents is not None:
+            expected_batch = batch_size * num_images_per_prompt
+            if image_latents.ndim != 3 or image_latent_ids.ndim != 3:
+                raise ValueError(
+                    "precomputed image conditioning must use rank-3 `[B, S, C]` tensors, "
+                    f"got latents={tuple(image_latents.shape)} ids={tuple(image_latent_ids.shape)}"
+                )
+            if image_latents.shape[:2] != image_latent_ids.shape[:2]:
+                raise ValueError(
+                    "precomputed image latents and IDs must share batch/sequence dimensions, "
+                    f"got latents={tuple(image_latents.shape)} ids={tuple(image_latent_ids.shape)}"
+                )
+            if image_latents.shape[0] != expected_batch:
+                raise ValueError(
+                    f"precomputed image conditioning batch must be {expected_batch}, "
+                    f"got {image_latents.shape[0]}"
+                )
+            if image_latents.shape[-1] != self.transformer.config.in_channels:
+                raise ValueError(
+                    "precomputed image conditioning channel mismatch: "
+                    f"expected={self.transformer.config.in_channels} got={image_latents.shape[-1]}"
+                )
+            image_latents = image_latents.to(
+                device=device,
+                dtype=self.transformer.dtype,
+                non_blocking=True,
+            )
+            image_latent_ids = image_latent_ids.to(device=device, non_blocking=True)
 
         # 6. Prepare timesteps
         image_seq_len = latents.shape[1]
@@ -1248,95 +1484,220 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             image_latents = image_latents.to(self.transformer.dtype)
 
         # 7. Denoising loop
-        # We set the index here to remove DtoH sync, helpful especially during compilation.
+        # Pass known latent dimensions into `_unpack_latents_with_ids()` so it does not
+        # infer H/W with `torch.max(...).item()`, which caused a blocking DtoH sync.
         # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
+        self._denoiser_request_generation = getattr(self, "_denoiser_request_generation", 0) + 1
         self.scheduler.set_begin_index(0)
         self.scheduler._step_index = None  # required when using timesteps cache (flux-stream-editor does this before each loop)
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
-
-                self._current_timestep = t
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latents.shape[0]).to(latents.dtype)
-
-                latent_model_input, latent_image_ids = self._prepare_denoiser_inputs(
-                    latents=latents,
-                    image_latents=image_latents,
-                    latent_ids=latent_ids,
-                    image_latent_ids=image_latent_ids,
+        denoiser_compute_mask = self._denoiser_compute_mask
+        if denoiser_compute_mask is not None:
+            if len(timesteps) != len(denoiser_compute_mask):
+                raise ValueError(
+                    "denoiser prediction reuse requires exactly four scheduler timesteps, "
+                    f"got {len(timesteps)}"
                 )
+            if self.do_classifier_free_guidance:
+                raise ValueError("denoiser prediction reuse does not support classifier-free guidance")
+            if cache_dit_mod is not None:
+                raise ValueError("denoiser prediction reuse and Cache-DiT are separate execution paths")
 
-                if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-                    torch.compiler.cudagraph_mark_step_begin()
+        compiled_loop_eligible = (
+            self._compiled_denoise_loop is not None
+            and self._compiled_denoise_loop_steps == num_inference_steps
+            and image_latents is not None
+            and image_latent_ids is not None
+            and not self.do_classifier_free_guidance
+            and callback_on_step_end is None
+            and self.attention_kwargs is None
+            and self._cuda_denoiser is None
+            and getattr(self, "_cache_dit_mod", None) is None
+            and denoiser_compute_mask is None
+            and not self.scheduler.config.stochastic_sampling
+        )
+        if compiled_loop_eligible:
+            initial_latent_model_input = None
+            latent_image_ids = self._prepare_denoiser_ids(
+                latent_ids=latent_ids,
+                image_latent_ids=image_latent_ids,
+                batch=latents.shape[0],
+                total_seq=latents.shape[1] + image_latents.shape[1],
+            )
+        else:
+            initial_latent_model_input, latent_image_ids = self._prepare_denoiser_inputs(
+                latents=latents,
+                image_latents=image_latents,
+                latent_ids=latent_ids,
+                image_latent_ids=image_latent_ids,
+            )
+        rotary_embeddings = self._get_rotary_embeddings_cached(latent_image_ids, text_ids)
+        use_compiled_loop = compiled_loop_eligible
+        if use_compiled_loop and not getattr(self, "_compiled_loop_active_logged", False):
+            logger.info("using resident compiled denoise loop steps=%d", num_inference_steps)
+            self._compiled_loop_active_logged = True
+        elif self._compiled_denoise_loop is not None and not use_compiled_loop and not getattr(
+            self, "_compiled_loop_fallback_logged", False
+        ):
+            logger.info(
+                "resident compiled denoise loop fallback callback=%s cfg=%s cache=%s attention_kwargs=%s",
+                callback_on_step_end is not None,
+                self.do_classifier_free_guidance,
+                getattr(self, "_cache_dit_mod", None) is not None,
+                self.attention_kwargs is not None,
+            )
+            self._compiled_loop_fallback_logged = True
+        if use_compiled_loop:
+            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
+            scheduler_dts = (
+                self.scheduler.sigmas[1 : num_inference_steps + 1]
+                - self.scheduler.sigmas[:num_inference_steps]
+            ).to(device=device, dtype=torch.float32)
+            if profile_inference:
+                _sync_accelerator(device)
+                _t0 = time.perf_counter()
+            latents = self._compiled_denoise_loop(
+                latents,
+                image_latents,
+                prompt_embeds,
+                text_ids,
+                latent_image_ids,
+                timesteps,
+                scheduler_dts,
+                rotary_embeddings,
+            )
+            self.scheduler._step_index = num_inference_steps
+            if profile_inference:
+                _sync_accelerator(device)
+                transformer_s += time.perf_counter() - _t0
+        else:
+            first_computed_noise_pred = None
+            reuse_noise_pred_base = None
+            reuse_noise_pred_delta = None
+            with self.progress_bar(total=num_inference_steps) as progress_bar:
+                for i, t in enumerate(timesteps):
+                    if self.interrupt:
+                        continue
 
-                if profile_inference:
-                    _sync_accelerator(device)
-                    _t0 = time.perf_counter()
+                    self._current_timestep = t
+                    timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                    compute_denoiser = denoiser_compute_mask is None or denoiser_compute_mask[i]
 
-                noise_pred = self._run_denoiser(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    txt_ids=text_ids,  # B, text_seq_len, 4
-                    img_ids=latent_image_ids,  # B, image_seq_len, 4
-                    joint_attention_kwargs=self.attention_kwargs,
-                    context="cond",
-                )
+                    if compute_denoiser:
+                        if i == 0:
+                            latent_model_input = initial_latent_model_input
+                        else:
+                            latent_model_input, latent_image_ids = self._prepare_denoiser_inputs(
+                                latents=latents,
+                                image_latents=image_latents,
+                                latent_ids=latent_ids,
+                                image_latent_ids=image_latent_ids,
+                            )
 
-                if profile_inference:
-                    _sync_accelerator(device)
-                    transformer_s += time.perf_counter() - _t0
+                        if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                            torch.compiler.cudagraph_mark_step_begin()
 
-                noise_pred = noise_pred[:, : latents.size(1) :]
+                        if profile_inference:
+                            _sync_accelerator(device)
+                            _t0 = time.perf_counter()
 
-                if self.do_classifier_free_guidance:
-                    if profile_inference:
-                        _sync_accelerator(device)
-                        _t0 = time.perf_counter()
+                        nsight_nvtx_enabled = getattr(self, "_nsight_nvtx_enabled", False)
+                        if nsight_nvtx_enabled:
+                            torch.cuda.nvtx.range_push(f"transformer_step_{i}")
+                        try:
+                            noise_pred = self._run_denoiser(
+                                hidden_states=latent_model_input,
+                                timestep=timestep,
+                                encoder_hidden_states=prompt_embeds,
+                                txt_ids=text_ids,
+                                img_ids=latent_image_ids,
+                                joint_attention_kwargs=self.attention_kwargs,
+                                context="cond",
+                                rotary_embeddings=rotary_embeddings,
+                            )
+                        finally:
+                            if nsight_nvtx_enabled:
+                                torch.cuda.nvtx.range_pop()
 
-                    neg_noise_pred = self._run_denoiser(
-                        hidden_states=latent_model_input,
-                        timestep=timestep,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        txt_ids=negative_text_ids,
-                        img_ids=latent_image_ids,
-                        joint_attention_kwargs=self._attention_kwargs,
-                        context="uncond",
-                    )
+                        if profile_inference:
+                            _sync_accelerator(device)
+                            transformer_s += time.perf_counter() - _t0
 
-                    if profile_inference:
-                        _sync_accelerator(device)
-                        transformer_s += time.perf_counter() - _t0
+                        noise_pred = noise_pred[:, : latents.size(1) :]
+                        if denoiser_compute_mask is not None:
+                            if first_computed_noise_pred is None:
+                                first_computed_noise_pred = noise_pred.clone()
+                            else:
+                                reuse_noise_pred_base = noise_pred.clone()
+                                reuse_noise_pred_delta = (
+                                    reuse_noise_pred_base - first_computed_noise_pred
+                                )
+                    else:
+                        if reuse_noise_pred_base is None or reuse_noise_pred_delta is None:
+                            raise RuntimeError(
+                                "denoiser prediction reuse requires two computed predictions"
+                            )
+                        extrapolation_order = i - 1
+                        noise_pred = (
+                            reuse_noise_pred_base
+                            + extrapolation_order * reuse_noise_pred_delta
+                        )
+                        if not getattr(self, "_denoiser_reuse_active_logged", False):
+                            logger.info(
+                                "using denoiser prediction extrapolation steps=2,3 compute_mask=1100"
+                            )
+                            self._denoiser_reuse_active_logged = True
 
-                    neg_noise_pred = neg_noise_pred[:, : latents.size(1) :]
-                    noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+                    if self.do_classifier_free_guidance:
+                        if profile_inference:
+                            _sync_accelerator(device)
+                            _t0 = time.perf_counter()
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents_dtype = latents.dtype
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                        neg_noise_pred = self._run_denoiser(
+                            hidden_states=latent_model_input,
+                            timestep=timestep,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            txt_ids=negative_text_ids,
+                            img_ids=latent_image_ids,
+                            joint_attention_kwargs=self._attention_kwargs,
+                            context="uncond",
+                            rotary_embeddings=rotary_embeddings,
+                        )
 
-                if latents.dtype != latents_dtype:
-                    if torch.backends.mps.is_available():
-                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                        if profile_inference:
+                            _sync_accelerator(device)
+                            transformer_s += time.perf_counter() - _t0
+
+                        neg_noise_pred = neg_noise_pred[:, : latents.size(1) :]
+                        noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+
+                    latents_dtype = latents.dtype
+                    if getattr(self, "_nsight_nvtx_enabled", False):
+                        torch.cuda.nvtx.range_push(f"scheduler_step_{i}")
+                    try:
+                        latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                    finally:
+                        if getattr(self, "_nsight_nvtx_enabled", False):
+                            torch.cuda.nvtx.range_pop()
+
+                    if latents.dtype != latents_dtype and torch.backends.mps.is_available():
                         latents = latents.to(latents_dtype)
 
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    if callback_on_step_end is not None:
+                        callback_kwargs = {}
+                        for k in callback_on_step_end_tensor_inputs:
+                            callback_kwargs[k] = locals()[k]
+                        callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                        latents = callback_outputs.pop("latents", latents)
+                        prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                    if i == len(timesteps) - 1 or (
+                        (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                    ):
+                        progress_bar.update()
 
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
-
-                if XLA_AVAILABLE:
-                    xm.mark_step()
+                    if XLA_AVAILABLE:
+                        xm.mark_step()
 
         self._current_timestep = None
 
@@ -1344,27 +1705,33 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             _sync_accelerator(device)
             _t0 = time.perf_counter()
 
-        latents = self._unpack_latents_with_ids(latents, latent_ids)
+        latent_height = int(height) // (self.vae_scale_factor * 2)
+        latent_width = int(width) // (self.vae_scale_factor * 2)
+        latents = self._unpack_latents_with_ids(latents, latent_ids, latent_height, latent_width)
 
-        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
-        latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
-            latents.device, latents.dtype
-        )
+        latents_bn_mean, latents_bn_std = self._get_vae_bn_constants(latents)
         latents = latents * latents_bn_std + latents_bn_mean
         latents = self._unpatchify_latents(latents)
         if output_type == "latent":
             image = latents
         else:
-            if self._vae_decode_fn is not None:
-                try:
-                    image = self._vae_decode_fn(latents)
-                except Exception:
-                    logger.warning("vae decoder compiled path failed, fallback to eager")
-                    self._vae_decode_fn = None
+            nsight_nvtx_enabled = getattr(self, "_nsight_nvtx_enabled", False)
+            if nsight_nvtx_enabled:
+                torch.cuda.nvtx.range_push("taef2_decode_and_postprocess")
+            try:
+                if self._vae_decode_fn is not None:
+                    try:
+                        image = self._vae_decode_fn(latents)
+                    except Exception:
+                        logger.warning("vae decoder compiled path failed, fallback to eager")
+                        self._vae_decode_fn = None
+                        image = self.vae.decode(latents, return_dict=False)[0]
+                else:
                     image = self.vae.decode(latents, return_dict=False)[0]
-            else:
-                image = self.vae.decode(latents, return_dict=False)[0]
-            image = self.image_processor.postprocess(image, output_type=output_type)
+                image = self.image_processor.postprocess(image, output_type=output_type)
+            finally:
+                if nsight_nvtx_enabled:
+                    torch.cuda.nvtx.range_pop()
 
         if profile_inference:
             _sync_accelerator(device)
