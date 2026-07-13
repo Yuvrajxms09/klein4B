@@ -25,10 +25,10 @@ the target dimensions. TAEF2 encoding still runs for every measured request.
 
 ## Enabled optimizations
 
-- **Transformer NVFP4:** all 109 transformer linear layers use TorchAO dynamic
-  W4A4 NVFP4 with Triton activation quantization.
-- **Qwen NVFP4:** the 189 active Qwen linear layers use the same dynamic W4A4
-  NVFP4 configuration.
+- **Transformer NVFP4:** transformer linear layers use TorchAO dynamic W4A4
+  NVFP4 with Triton activation quantization.
+- **Qwen NVFP4:** active Qwen linear layers use the same dynamic W4A4 NVFP4
+  configuration.
 - **Reduced Qwen execution:** Klein consumes hidden states 9, 18, and 27, so the
   text encoder stops after layer 27 and bypasses the unused language-model head.
 - **TAEF2:** replaces the original VAE for faster image encoding and decoding.
@@ -41,23 +41,10 @@ the target dimensions. TAEF2 encoding still runs for every measured request.
   coordinate-descent tuning in all directions; epilogue fusion is disabled.
 - **Native attention:** exact native attention is used. Flash and Sage attention
   did not improve this NVFP4 workload.
-- **Latent-unpack fix:** known latent dimensions are passed directly, avoiding
-  synchronizing `Tensor.item()` calls used to infer height and width.
-- **Resident metadata:** timesteps, latent position IDs, RoPE tensors, and VAE
-  batch-normalization constants are cached by shape, dtype, and device.
-- **Fast input transfer:** preprocessing uses pinned CPU memory and non-blocking
-  host-to-device copies where supported.
 
 Prompt embeddings are cached by default. Repeating a prompt skips Qwen encoding
 even if the input image changes. Encoded image contents are not cached; only
 shape-dependent image position IDs are reused.
-
-## Not enabled
-
-The reference benchmark does not enable Cache-DiT, prediction reuse, approximate
-attention, QKV fusion, custom Klein CUDA block patches, or the experimental
-native backends in `cuda_kernels/`. These paths remain in the repository for
-experimentation but are not part of the 113-115 ms result.
 
 ## Setup
 
