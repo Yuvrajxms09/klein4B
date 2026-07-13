@@ -1,49 +1,94 @@
 # FLUX.2 Klein 4B
 
-Inference pipeline for `black-forest-labs/FLUX.2-klein-4B`: T2I and I2I via 4-step distilled model
+Optimized img2img inference for `black-forest-labs/FLUX.2-klein-4B` on NVIDIA
+Blackwell GPUs. The reference workload is batch size 1, 576x384, four denoising
+steps, guidance 1.0, and PIL output.
 
-## Optimizations in place
+## Reference benchmark
 
-- **torch.compile** – Transformer and VAE encode/decode are compiled. `dynamic=True` so it doesn’t recompile across resolutions.
-- **Sage attention** – Default attention backend.
-- **cache-dit** – Faster transformer steps via DBCache.
-- **In-place Flux2 transformer patching** – `apply_flux2_transformer_klein_ops(transformer)` patches a loaded Diffusers Flux2 transformer instance to use the local CUDA-backed block helpers where the structure matches.
+[`fastest_script_115ms.py`](fastest_script_115ms.py) is the supported benchmark
+for this branch. On an RTX PRO 6000 it runs at roughly 113-115 ms end to end,
+excluding model loading, compilation, warmup, file writes, Modal startup, and
+network latency.
 
-We tried a lighter VAE (TAEF2) for faster encode/decode; it reduced output quality, so we keep the original VAE.
+The measured interval includes:
 
-## Usage
+- prompt tokenization and Qwen encoding;
+- input transfer and TAEF2 image encoding;
+- latent creation;
+- four complete transformer and scheduler steps;
+- latent unpacking and normalization;
+- TAEF2 decoding and conversion to an in-memory PIL image.
 
-- **`klein_pipeline.py`** – Loads and run T2I/I2I.
-- **`cache_dit_klein.py`** – `enable_cache_dit(pipe)` and `apply_attention_backend(pipe, "sage")` (or `"auto"` / `"native"`). Call after loading the pipeline.
-- **Flux2 transformer patching** – if your notebook loads `Flux2Transformer2DModel` from Diffusers, call `apply_flux2_transformer_klein_ops(pipe.transformer)` before `pipe.enable_compile(...)`.
-- **Custom CUDA denoiser hook** – Register a compiled `torch.ops` backend to replace transformer forward only:
-  - `enable_cuda_denoiser_op(pipe, "klein_cuda.denoise_step", expected_hidden_tokens=..., enforce_cfg1=True)`
-  - `latent_token_count_for_resolution(pipe, height=384, width=576)` helps compute expected tokens for fixed-shape runs.
-- **Ported CUDA kernels** – `cuda_kernels/` contains specialized fused CUDA ops ported from `klein-cuda-c`.
-  Build with:
-  - `cd cuda_kernels && python3 setup.py build_ext --inplace`
-  Then load:
-  - `from cache_dit_klein import load_ported_cuda_kernels; load_ported_cuda_kernels()`
-- **Option A backend bridge (strict klein-cuda-c runtime)**:
-  - Build bridge:
-    - `cd klein_c_bridge && bash build_bridge.sh`
-  - Enable in pipeline:
-    - `from cache_dit_klein import enable_klein_c_cuda_backend`
-    - `enable_klein_c_cuda_backend(pipe, model_dir="/path/to/flux-klein-model")`
-  - Multi-reference is supported through the same bridge path (maps token `t` offsets to klein-cuda-c reference offsets).
-- **Full native path (same denoising/sampling runtime as klein-cuda-c)**:
-  - `from cache_dit_klein import build_klein_c_full_backend`
-  - `backend = build_klein_c_full_backend(model_dir="/path/to/flux-klein-model")`
-  - `backend.img2img(prompt, image, KleinGenerateConfig(...))`
-  - `backend.multiref(prompt, refs, KleinGenerateConfig(...))`
-  This runs img2img/multiref through `flux_img2img` / `flux_multiref` in the C/CUDA runtime.
+The source image is preprocessed once because the benchmark input already has
+the target dimensions. TAEF2 encoding still runs for every measured request.
 
-Enable compile after setup: `pipe.enable_compile(dynamic=True)`.
+## Enabled optimizations
 
-For the Colab notebook stack you shared, the intended order is:
+- **Transformer NVFP4:** all 109 transformer linear layers use TorchAO dynamic
+  W4A4 NVFP4 with Triton activation quantization.
+- **Qwen NVFP4:** the 189 active Qwen linear layers use the same dynamic W4A4
+  NVFP4 configuration.
+- **Reduced Qwen execution:** Klein consumes hidden states 9, 18, and 27, so the
+  text encoder stops after layer 27 and bypasses the unused language-model head.
+- **TAEF2:** replaces the original VAE for faster image encoding and decoding.
+- **Channels-last VAE:** TAEF2 and its decoder use channels-last memory layout.
+- **Static compilation:** Qwen, the transformer, and TAEF2 decode use
+  `torch.compile(mode="max-autotune", dynamic=False, fullgraph=False)`.
+- **TAEF2 encode compilation:** uses `max-autotune-no-cudagraphs` because its
+  output is consumed by a separately compiled graph.
+- **Inductor tuning:** enables 1x1 convolution as matrix multiplication and
+  coordinate-descent tuning in all directions; epilogue fusion is disabled.
+- **Native attention:** exact native attention is used. Flash and Sage attention
+  did not improve this NVFP4 workload.
+- **Latent-unpack fix:** known latent dimensions are passed directly, avoiding
+  synchronizing `Tensor.item()` calls used to infer height and width.
+- **Resident metadata:** timesteps, latent position IDs, RoPE tensors, and VAE
+  batch-normalization constants are cached by shape, dtype, and device.
+- **Fast input transfer:** preprocessing uses pinned CPU memory and non-blocking
+  host-to-device copies where supported.
 
-1. Load the FP8 `Flux2Transformer2DModel`
-2. Call `apply_flux2_transformer_klein_ops(transformer)`
-3. Build the pipeline
-4. Apply `enable_cache_dit(pipe)` and `apply_attention_backend(pipe, "auto")`
-5. Call `pipe.enable_compile(...)`
+Prompt embeddings are cached by default. Repeating a prompt skips Qwen encoding
+even if the input image changes. Encoded image contents are not cached; only
+shape-dependent image position IDs are reused.
+
+## Not enabled
+
+The reference benchmark does not enable Cache-DiT, prediction reuse, approximate
+attention, QKV fusion, custom Klein CUDA block patches, or the experimental
+native backends in `cuda_kernels/`. These paths remain in the repository for
+experimentation but are not part of the 113-115 ms result.
+
+## Setup
+
+Clone this branch and keep a Diffusers checkout beside the repository:
+
+```bash
+git clone -b optimized-nvfp4-115ms --single-branch \
+  https://github.com/Yuvrajxms09/klein4B.git
+git clone https://github.com/huggingface/diffusers.git
+```
+
+The Modal volume `klein4B-assets` must already contain the Klein model and input
+image expected by the script. TAEF2 artifacts are fetched into the container
+cache when missing. No weights are downloaded to the local machine.
+
+Run from the `klein4B` directory:
+
+```bash
+modal run fastest_script_115ms.py
+```
+
+The script saves generated images and `benchmark.json` to
+`/mnt/klein4B-assets/bench_outputs_nvfp4` after timing finishes.
+
+## Main files
+
+- `fastest_script_115ms.py`: Modal setup, quantization, compilation, benchmark,
+  and output saving.
+- `klein_pipeline.py`: optimized Klein img2img pipeline and inference caches.
+- `taef2_vae.py`: TAEF2 integration.
+- `cache_dit_klein.py`: optional attention, Cache-DiT, and experimental runtime
+  helpers. These are not enabled by the reference benchmark.
+- `cuda_kernels/`: experimental CUDA and Triton kernels, also disabled in the
+  reference benchmark.
