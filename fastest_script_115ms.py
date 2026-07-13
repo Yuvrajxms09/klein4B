@@ -11,13 +11,12 @@ This is the reference 576x384, 4 step config. It uses:
   ``max-autotune-no-cudagraphs``.
 - Inductor's 1x1-convolution matmul and coordinate-descent tuning options.
 
-Each timed request uses a fresh prompt and includes text encoding, image
+Each timed request includes text encoding, image
 encoding, latent setup, all four denoising steps, image decoding, and conversion
 to a PIL image. Model loading, NVFP4 setup, compilation, warmup, and file writes
-are outside the measured interval. The script measures 20 prompts, then saves
-the images and ``benchmark.json`` to the Modal volume. Prompt caching remains
-enabled for normal repeated-prompt use. A separate pass repeats six prompts to
-verify cache hits without mixing them into the fresh-prompt summary.
+are outside the measured interval. The list contains 20 unique prompts followed
+by four repeats so cached-prompt timings are visible in the normal logs. Images
+and ``benchmark.json`` are saved to the Modal volume after timing.
 
 Clone the ``optimized-nvfp4-115ms`` branch and keep the Diffusers checkout next
 to the ``klein4B`` directory.
@@ -109,6 +108,10 @@ DEFAULT_BENCHMARK_PROMPTS: tuple[str, ...] = (
     "with a minimalist background",
     "in a lush tropical jungle",
     "as a high contrast black and white photo",
+    "from top angle",
+    "on a bike",
+    "on a mountain road",
+    "in a rainy city at night",
 )
 
 
@@ -294,8 +297,8 @@ def benchmark(
         raise FileNotFoundError(f"image_path not found: {image_path}")
 
     prompt_list = list(prompts) if prompts is not None else list(DEFAULT_BENCHMARK_PROMPTS)
-    if len(prompt_list) != 20 or len(set(prompt_list)) != 20:
-        raise ValueError("benchmark requires exactly 20 distinct prompts")
+    if len(prompt_list) != 24 or len(set(prompt_list)) != 20:
+        raise ValueError("benchmark requires 20 unique prompts followed by four repeats")
     input_image = Image.open(image_path).convert("RGB").resize((width, height))
 
     dtype = torch.bfloat16
@@ -313,7 +316,6 @@ def benchmark(
     )
     pipe.set_progress_bar_config(disable=True)
     pipe = pipe.to("cuda")
-    pipe._cache_prompt = True
 
     text_encoder_report = _quantize_and_compile_text_encoder(pipe)
     replace_pipeline_vae_with_taef2(pipe, cache_dir=taef2_cache_dir)
@@ -446,32 +448,6 @@ def benchmark(
         fraction = index - lo
         return ordered[lo] * (1 - fraction) + ordered[hi] * fraction
 
-    repeated_prompts = prompt_list[:6]
-    cached_wall_times: list[float] = []
-    cached_cuda_times: list[float] = []
-    for i, prompt in enumerate(repeated_prompts):
-        cache_key = ((prompt,), 1, 512, (9, 18, 27))
-        if cache_key not in pipe._prompt_cache:
-            raise RuntimeError(f"Prompt was not cached after its first request: {prompt!r}")
-
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        start_event.record()
-        with torch.inference_mode():
-            call_pipeline(prompt)
-        end_event.record()
-        end_event.synchronize()
-        wall_ms = (time.perf_counter() - t0) * 1000.0
-        cuda_ms = start_event.elapsed_time(end_event)
-        cached_wall_times.append(wall_ms)
-        cached_cuda_times.append(cuda_ms)
-        print(
-            f"[cache {i + 1:02d}/{len(repeated_prompts):02d}] "
-            f"wall={wall_ms:.3f} ms cuda={cuda_ms:.3f} ms | {prompt}"
-        )
-
     result = {
         "backend": "torchao-nvfp4",
         "resolution": [height, width],
@@ -498,30 +474,14 @@ def benchmark(
             "p95": percentile(cuda_times, 0.95),
             "min": min(cuda_times),
         },
-        "prompt_cache": {
-            "enabled": True,
-            "validated_hits": len(repeated_prompts),
-            "repeated_prompts": repeated_prompts,
-            "wall_ms": cached_wall_times,
-            "cuda_event_ms": cached_cuda_times,
-            "wall_summary_ms": {
-                "mean": statistics.fmean(cached_wall_times),
-                "median": statistics.median(cached_wall_times),
-                "min": min(cached_wall_times),
-            },
-            "cuda_summary_ms": {
-                "mean": statistics.fmean(cached_cuda_times),
-                "median": statistics.median(cached_cuda_times),
-                "min": min(cached_cuda_times),
-            },
-        },
         "attention": "native",
         "transformer_compile": "max-autotune",
         "input_preprocessed_outside_timing": True,
         "prompt_embeds_precomputed_outside_timing": False,
         "noise_precomputed_outside_timing": False,
         "prompt_cache_enabled": True,
-        "unique_prompt_count": len(prompt_list),
+        "measured_prompt_count": len(prompt_list),
+        "unique_prompt_count": len(set(prompt_list)),
         "expected_full_compute_nvfp4_gemms": 436,
     }
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -535,7 +495,7 @@ def benchmark(
             volume_mount=VOLUME_MOUNT,
             benchmark_result=result,
         )
-        print(f"Saved 20 images and benchmark.json to {run_dir} (post-timed)")
+        print(f"Saved {len(outputs)} images and benchmark.json to {run_dir} (post-timed)")
     return result
 
 
