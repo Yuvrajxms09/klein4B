@@ -56,14 +56,38 @@ git clone -b optimized-nvfp4-115ms --single-branch \
 git clone https://github.com/huggingface/diffusers.git
 ```
 
-The Modal volume `klein4B-assets` must already contain the Klein model and input
-image expected by the script. TAEF2 artifacts are fetched into the container
-cache when missing. No weights are downloaded to the local machine.
+The Modal volume `klein4B-assets` must already contain the original Klein model
+and input image expected by the scripts. TAEF2 artifacts are fetched into the
+container cache when missing. No weights are downloaded to the local machine.
 
-Run from the `klein4B` directory:
+The reference benchmark remains self-contained and performs weight quantization
+when its container starts:
 
 ```bash
 modal run fastest_script_115ms.py
+```
+
+An optional startup-optimized variant loads already packed weights directly
+from Hugging Face. Prepare and publish its deployment artifact once:
+
+```bash
+modal run modal_prepare_nvfp4_artifact.py
+```
+
+This writes the packed transformer and 27-layer Qwen weights to
+`/mnt/klein4B-assets/FLUX.2-klein-4B-torchao-nvfp4`, validates a pre-quantized
+reload, and uploads the same artifact to Hugging Face. The repository is public
+by default at `Yuvrajxms09/klein-torchao-artifacts`; pass `--private` when
+creating a private repository. Existing artifacts are validated and reused
+unless `--force` is supplied.
+
+Then run the separate pre-quantized benchmark. It downloads the transformer and
+text encoder from the validated `Yuvrajxms09/klein-torchao-artifacts` commit;
+the Modal volume is still used for the original pipeline metadata and input
+image.
+
+```bash
+modal run fastest_script_prequantized_nvfp4.py
 ```
 
 The script saves generated images and `benchmark.json` to
@@ -71,8 +95,13 @@ The script saves generated images and `benchmark.json` to
 
 ## Main files
 
-- `fastest_script_115ms.py`: Modal setup, quantization, compilation, benchmark,
-  and output saving.
+- `fastest_script_115ms.py`: supported reference benchmark with runtime weight
+  quantization, compilation, timing, and output saving.
+- `fastest_script_prequantized_nvfp4.py`: optional benchmark that loads the
+  published NVFP4 weights directly from Hugging Face instead of quantizing them
+  at container startup.
+- `modal_prepare_nvfp4_artifact.py`: one-time NVFP4 weight export, reload
+  validation, Modal Volume persistence, and Hugging Face upload.
 - `klein_pipeline.py`: optimized Klein img2img pipeline and inference caches.
 - `taef2_vae.py`: TAEF2 integration.
 - `cache_dit_klein.py`: optional attention, Cache-DiT, and experimental runtime

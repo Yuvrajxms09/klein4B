@@ -1,4 +1,4 @@
-"""script for running the Klein 4B optimized i2i benchmark on modal.
+"""Run the pre-quantized-weight variant of the optimized Klein benchmark.
 
 This is the reference 576x384, 4 step config. It uses:
 
@@ -12,15 +12,16 @@ This is the reference 576x384, 4 step config. It uses:
   ``max-autotune-no-cudagraphs``.
 - Inductor's 1x1-convolution matmul and coordinate-descent tuning options.
 
-This file quantizes the transformer and text-encoder weights when the container
-starts. To run the same benchmark with pre-quantized NVFP4 weights loaded from
-Hugging Face, use ``fastest_script_prequantized_nvfp4.py``:
-https://github.com/Yuvrajxms09/klein4B/blob/optimized-nvfp4-115ms/fastest_script_prequantized_nvfp4.py
+The transformer and text encoder are downloaded directly from the pre-quantized
+Hugging Face artifact created by ``modal_prepare_nvfp4_artifact.py``. Weight
+quantization is therefore not repeated when a benchmark container starts.
+Activation quantization remains dynamic during inference, as required by the
+W4A4 configuration.
 
 Clone the ``optimized-nvfp4-115ms`` branch and keep the Diffusers checkout next
 to the ``klein4B`` directory.
 
-Run: ``modal run fastest_script_115ms.py``
+Run: ``modal run fastest_script_prequantized_nvfp4.py``
 """
 
 
@@ -38,7 +39,7 @@ from pathlib import Path
 import modal
 
 
-APP = modal.App("klein4b-inference-bench-nvfp4")
+APP = modal.App("klein4b-inference-bench-prequantized-nvfp4")
 HF_SECRET = modal.Secret.from_name("huggingface-secret")
 
 
@@ -67,7 +68,10 @@ image = (
     .pip_install("cache-dit")
     .pip_install("kernels==0.16.0")
     .pip_install("ninja", "setuptools", "wheel")
-    .run_commands("pip install -U git+https://github.com/huggingface/transformers.git")
+    .run_commands(
+        "pip install -U git+https://github.com/huggingface/transformers.git@"
+        "63f32a8782cb70da3365acab16f2b67947737985"
+    )
     .run_commands("pip install torchao==0.17.0")
     .run_commands("pip install mslk-cuda==1.1.0")
     .add_local_dir(
@@ -85,6 +89,8 @@ image = (
 
 MODEL_VOLUME = modal.Volume.from_name("klein4B-assets", create_if_missing=False)
 VOLUME_MOUNT = "/mnt/klein4B-assets"
+PREQUANTIZED_REPO_ID = "Yuvrajxms09/klein-torchao-artifacts"
+PREQUANTIZED_REVISION = "7fd5321202831de6c833bd55f318c2f5e92a1bdd"
 
 DEFAULT_BENCHMARK_PROMPTS: tuple[str, ...] = (
     "from top angle",
@@ -129,83 +135,106 @@ def _require_nvfp4_linears(module, *, expected: int, component: str) -> int:
             f"{component} is not fully quantized to NVFP4: expected {expected} "
             f"linear layers, found {count}"
         )
+
+    invalid_activation_configs = []
+    for name, child in module.named_modules():
+        weight = getattr(child, "weight", None)
+        if weight is None or not isinstance(weight, NVFP4Tensor):
+            continue
+        activation_config = getattr(weight, "act_quant_kwargs", None)
+        if activation_config is None or not getattr(
+            activation_config,
+            "use_dynamic_per_tensor_scale",
+            False,
+        ):
+            invalid_activation_configs.append(name)
+    if invalid_activation_configs:
+        raise RuntimeError(
+            f"{component} contains NVFP4 weights without dynamic activation "
+            f"quantization: {invalid_activation_configs[:5]}"
+        )
     return count
 
 
-def _load_nvfp4_transformer(*, model_dir: str, dtype, local_files_only: bool = True):
-    from diffusers import Flux2Transformer2DModel, TorchAoConfig
-
-    try:
-        from torchao.prototype.mx_formats import NVFP4DynamicActivationNVFP4WeightConfig
-    except ImportError as exc:
+def _require_prequantized_loader(model, *, component: str) -> None:
+    quantizer = getattr(model, "hf_quantizer", None)
+    if quantizer is None or not getattr(quantizer, "pre_quantized", False):
         raise RuntimeError(
-            "NVFP4 import failed. Install a recent torchao (e.g. pip install -U torchao) "
-            "and ensure torchao.prototype.mx_formats is available."
-        ) from exc
-
-    quantization_config = TorchAoConfig(
-        NVFP4DynamicActivationNVFP4WeightConfig(
-            use_triton_kernel=True,
-            use_dynamic_per_tensor_scale=True,
-        ),
-    )
-
-    transformer = Flux2Transformer2DModel.from_pretrained(
-        model_dir,
-        subfolder="transformer",
-        quantization_config=quantization_config,
-        torch_dtype=dtype,
-        local_files_only=local_files_only,
-    )
-    _require_nvfp4_linears(transformer, expected=109, component="Transformer")
-    return transformer
-
-
-def _quantize_and_compile_text_encoder(pipe) -> dict[str, int]:
-    import torch
-    from torchao.prototype.mx_formats import NVFP4DynamicActivationNVFP4WeightConfig
-    from torchao.quantization import quantize_
-
-    decoder = pipe.text_encoder.model
-    original_layer_count = len(decoder.layers)
-    required_layer_count = 27
-    if original_layer_count < required_layer_count:
-        raise RuntimeError(
-            f"Qwen text encoder has {original_layer_count} layers; "
-            f"Klein requires {required_layer_count}"
+            f"{component} was not loaded as a pre-quantized checkpoint. "
+            "Refusing to benchmark a runtime-quantized fallback."
         )
 
-    # Klein consumes hidden states 9, 18, and 27. Later layers and lm_head do
-    # not contribute to its prompt embeddings.
-    decoder.layers = torch.nn.ModuleList(list(decoder.layers[:required_layer_count]))
-    quantize_(
-        decoder,
-        NVFP4DynamicActivationNVFP4WeightConfig(
-            use_triton_kernel=True,
-            use_dynamic_per_tensor_scale=True,
-        ),
-        device="cuda",
+
+def _load_prequantized_components(
+    *,
+    repo_id: str,
+    revision: str,
+    dtype,
+    token: str | None,
+):
+    import torchao.prototype.mx_formats  # noqa: F401
+    from diffusers import Flux2Transformer2DModel
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoModelForCausalLM
+
+    manifest_path = hf_hub_download(
+        repo_id=repo_id,
+        filename="manifest.json",
+        revision=revision,
+        token=token,
+    )
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    if manifest.get("quantization", {}).get("format") != "torchao-nvfp4":
+        raise RuntimeError(f"Unexpected artifact format in {repo_id}@{revision}")
+
+    transformer = Flux2Transformer2DModel.from_pretrained(
+        repo_id,
+        subfolder="transformer",
+        revision=revision,
+        token=token,
+        torch_dtype=dtype,
+        local_files_only=False,
+        use_safetensors=False,
+    )
+    text_encoder = AutoModelForCausalLM.from_pretrained(
+        repo_id,
+        subfolder="text_encoder",
+        revision=revision,
+        token=token,
+        torch_dtype=dtype,
+        local_files_only=False,
     )
 
-    expected_linear_count = required_layer_count * 7
-    nvfp4_linear_count = _require_nvfp4_linears(
+    _require_prequantized_loader(transformer, component="Transformer")
+    _require_prequantized_loader(text_encoder, component="Qwen text encoder")
+    transformer_count = _require_nvfp4_linears(
+        transformer,
+        expected=109,
+        component="Transformer",
+    )
+
+    decoder = text_encoder.model
+    required_layer_count = 27
+    if len(decoder.layers) != required_layer_count:
+        raise RuntimeError(
+            f"Pre-quantized Qwen artifact must contain exactly "
+            f"{required_layer_count} layers, found {len(decoder.layers)}"
+        )
+    text_encoder_count = _require_nvfp4_linears(
         decoder,
-        expected=expected_linear_count,
+        expected=required_layer_count * 7,
         component="Qwen decoder",
     )
 
-    pipe.text_encoder.model = torch.compile(
-        decoder,
-        mode="max-autotune",
-        fullgraph=False,
-        dynamic=False,
-    )
     report = {
-        "original_decoder_layers": original_layer_count,
-        "executed_decoder_layers": required_layer_count,
-        "nvfp4_linear_count": nvfp4_linear_count,
+        "artifact_repo_id": repo_id,
+        "artifact_revision": revision,
+        "weights_loaded_prequantized": True,
+        "transformer_nvfp4_linear_count": transformer_count,
+        "text_encoder_nvfp4_linear_count": text_encoder_count,
+        "text_encoder_decoder_layers": required_layer_count,
     }
-    return report
+    return transformer, text_encoder, report
 
 
 def _safe_prompt_slug(prompt: str, max_len: int = 48) -> str:
@@ -256,6 +285,8 @@ def _save_benchmark_images_after_timing(
 def benchmark(
     *,
     model_dir: str = "/mnt/klein4B-assets/FLUX.2-klein-4B",
+    prequantized_repo_id: str = PREQUANTIZED_REPO_ID,
+    prequantized_revision: str = PREQUANTIZED_REVISION,
     image_path: str = "/mnt/klein4B-assets/calib/blue_car.jpeg",
     height: int = 576,
     width: int = 384,
@@ -301,22 +332,29 @@ def benchmark(
     input_image = Image.open(image_path).convert("RGB").resize((width, height))
 
     dtype = torch.bfloat16
-    transformer = _load_nvfp4_transformer(
-        model_dir=model_dir,
+    transformer, text_encoder, prequantized_report = _load_prequantized_components(
+        repo_id=prequantized_repo_id,
+        revision=prequantized_revision,
         dtype=dtype,
-        local_files_only=local_files_only,
+        token=os.environ.get("HF_TOKEN"),
     )
 
     pipe = Flux2KleinPipeline.from_pretrained(
         model_dir,
         transformer=transformer,
+        text_encoder=text_encoder,
         torch_dtype=dtype,
         local_files_only=local_files_only,
     )
     pipe.set_progress_bar_config(disable=True)
     pipe = pipe.to("cuda")
 
-    text_encoder_report = _quantize_and_compile_text_encoder(pipe)
+    pipe.text_encoder.model = torch.compile(
+        pipe.text_encoder.model,
+        mode="max-autotune",
+        fullgraph=False,
+        dynamic=False,
+    )
     replace_pipeline_vae_with_taef2(pipe, cache_dir=taef2_cache_dir)
     if hasattr(pipe.vae, "taesd") and hasattr(pipe.vae.taesd, "decoder"):
         pipe.vae.taesd.decoder.to(memory_format=torch.channels_last)
@@ -457,7 +495,11 @@ def benchmark(
         "vae": "taef2",
         "text_encoder_backend": "torchao-nvfp4",
         "text_encoder_compile": "max-autotune",
-        "text_encoder": text_encoder_report,
+        "prequantized_artifact": prequantized_report,
+        "text_encoder": {
+            "executed_decoder_layers": 27,
+            "nvfp4_linear_count": prequantized_report["text_encoder_nvfp4_linear_count"],
+        },
         "warmup_ms": warmup_times,
         "wall_ms": wall_times,
         "cuda_event_ms": cuda_times,
