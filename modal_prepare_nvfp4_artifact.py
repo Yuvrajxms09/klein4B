@@ -1,9 +1,10 @@
-"""Build and publish the TorchAO NVFP4 checkpoint used by the benchmark.
+"""Create and publish the pre-quantized TorchAO checkpoint used by the benchmark.
 
-The script quantizes the Klein transformer and active 27-layer Qwen encoder,
-writes the artifact atomically to the ``klein4B-assets`` Modal volume, validates
-a pre-quantized reload, and uploads the same files to Hugging Face. Runtime
-activation quantization remains dynamic.
+The first run quantizes the Klein transformer and the active 27-layer Qwen text
+encoder, writes an atomic artifact to the ``klein4B-assets`` Modal volume,
+validates that both components reload as pre-quantized models, and uploads the
+same artifact to a Hugging Face model repository. Later benchmark runs
+load these packed weights directly; activation quantization remains dynamic.
 
 Run once before ``fastest_script_prequantized_nvfp4.py``:
 
