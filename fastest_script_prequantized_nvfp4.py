@@ -1,29 +1,11 @@
-"""Run the pre-quantized-weight variant of the optimized Klein benchmark.
+"""Modal benchmark using pre-quantized FLUX.2 Klein 4B NVFP4 weights.
 
-This is the reference 576x384, 4 step config. It uses:
+The transformer and reduced 27-layer Qwen encoder are loaded from the pinned
+Hugging Face artifact below. Their weights are already packed as NVFP4, while
+TorchAO still quantizes request-dependent activations at inference time. The
+remaining inference configuration matches ``fastest_script_115ms.py``.
 
-- TorchAO W4A4 NVFP4 for the transformer and qwen text encoder.
-- The first 27 Qwen layers, which provide Klein's requested hidden states.
-- TAEF2 (faster encoder-decoder) instead of the original VAE, using channels-last layout.
-- Native attention.(tested flash and sage - got no speedup with nvfp4 quants)
-- prompts are cached by default in klein4B repo, so it saves around 10ms in case of repeated prompts
-- ``torch.compile`` with static shapes and ``max-autotune`` for qwen, the
-  transformer, and TAEF2 decode, encode uses
-  ``max-autotune-no-cudagraphs``.
-- Inductor's 1x1-convolution matmul and coordinate-descent tuning options.
-
-The transformer and text encoder are downloaded directly from the pre-quantized
-Hugging Face artifact created by ``modal_prepare_nvfp4_artifact.py``. Weight
-quantization is therefore not repeated when a benchmark container starts.
-Activation quantization remains dynamic during inference, as required by the
-W4A4 configuration.
-
-NVFP4 weight repository:
-https://huggingface.co/Yuvrajxms09/klein-torchao-artifacts
-
-Clone the ``optimized-nvfp4-115ms`` branch and keep the Diffusers checkout next
-to the ``klein4B`` directory.
-
+Weights: https://huggingface.co/Yuvrajxms09/klein-torchao-artifacts
 Run: ``modal run fastest_script_prequantized_nvfp4.py``
 """
 
@@ -404,8 +386,7 @@ def benchmark(
         dynamic=False,
     )
 
-    # The source is already fixed at the production dimensions. Keep only this
-    # deterministic CPU preprocessing outside the request timing.
+    # CPU preprocessing is excluded; TAEF2 image encoding remains timed.
     prepared_image = pipe.image_processor.preprocess(
         input_image,
         height=height,

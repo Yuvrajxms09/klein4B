@@ -1,10 +1,9 @@
-"""Create and publish the pre-quantized TorchAO checkpoint used by the benchmark.
+"""Build and publish the TorchAO NVFP4 checkpoint used by the benchmark.
 
-The first run quantizes the Klein transformer and the active 27-layer Qwen text
-encoder, writes an atomic artifact to the ``klein4B-assets`` Modal volume,
-validates that both components reload as pre-quantized models, and uploads the
-same artifact to a Hugging Face model repository. Later benchmark runs
-load these packed weights directly; activation quantization remains dynamic.
+The script quantizes the Klein transformer and active 27-layer Qwen encoder,
+writes the artifact atomically to the ``klein4B-assets`` Modal volume, validates
+a pre-quantized reload, and uploads the same files to Hugging Face. Runtime
+activation quantization remains dynamic.
 
 Run once before ``fastest_script_prequantized_nvfp4.py``:
 
@@ -286,13 +285,26 @@ def _write_metadata(*, artifact_dir: Path, source_dir: Path) -> None:
         encoding="utf-8",
     )
     (artifact_dir / "README.md").write_text(
-        "# FLUX.2 Klein 4B TorchAO NVFP4 artifact\n\n"
-        "This deployment artifact contains pre-quantized TorchAO NVFP4 "
-        "weights for the Klein transformer and its reduced 27-layer Qwen text "
-        "encoder. Activations are quantized dynamically at inference time. The "
-        "original FLUX.2 Klein 4B repository is still required for the tokenizer, "
-        "scheduler, and remaining pipeline components. See `manifest.json` for "
-        "the exact configuration and package versions.\n",
+        "---\n"
+        "base_model: black-forest-labs/FLUX.2-klein-4B\n"
+        "library_name: diffusers\n"
+        "pipeline_tag: image-to-image\n"
+        "tags:\n"
+        "  - torchao\n"
+        "  - nvfp4\n"
+        "  - quantized\n"
+        "  - blackwell\n"
+        "---\n\n"
+        "# FLUX.2 Klein 4B TorchAO NVFP4\n\n"
+        "Pre-quantized TorchAO NVFP4 weights for the FLUX.2 Klein 4B transformer "
+        "and the active 27-layer Qwen encoder. Activations remain dynamically "
+        "quantized at inference time.\n\n"
+        "The original [FLUX.2 Klein 4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) "
+        "repository is required for the tokenizer, scheduler, and remaining "
+        "pipeline components. Loading and benchmark code is available in the "
+        "[`optimized-nvfp4-115ms`](https://github.com/Yuvrajxms09/klein4B/tree/optimized-nvfp4-115ms) "
+        "branch. See `manifest.json` for serialization details and pinned package "
+        "versions.\n",
         encoding="utf-8",
     )
 
