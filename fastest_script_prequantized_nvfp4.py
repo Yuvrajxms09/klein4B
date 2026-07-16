@@ -18,6 +18,9 @@ quantization is therefore not repeated when a benchmark container starts.
 Activation quantization remains dynamic during inference, as required by the
 W4A4 configuration.
 
+NVFP4 weight repository:
+https://huggingface.co/Yuvrajxms09/klein-torchao-artifacts
+
 Clone the ``optimized-nvfp4-115ms`` branch and keep the Diffusers checkout next
 to the ``klein4B`` directory.
 

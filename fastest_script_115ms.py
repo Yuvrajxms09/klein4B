@@ -17,6 +17,9 @@ starts. To run the same benchmark with pre-quantized NVFP4 weights loaded from
 Hugging Face, use ``fastest_script_prequantized_nvfp4.py``:
 https://github.com/Yuvrajxms09/klein4B/blob/optimized-nvfp4-115ms/fastest_script_prequantized_nvfp4.py
 
+Pre-quantized transformer and 27-layer Qwen NVFP4 weights:
+https://huggingface.co/Yuvrajxms09/klein-torchao-artifacts
+
 Clone the ``optimized-nvfp4-115ms`` branch and keep the Diffusers checkout next
 to the ``klein4B`` directory.
 

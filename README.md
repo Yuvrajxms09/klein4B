@@ -77,9 +77,10 @@ modal run modal_prepare_nvfp4_artifact.py
 This writes the packed transformer and 27-layer Qwen weights to
 `/mnt/klein4B-assets/FLUX.2-klein-4B-torchao-nvfp4`, validates a pre-quantized
 reload, and uploads the same artifact to Hugging Face. The repository is public
-by default at `Yuvrajxms09/klein-torchao-artifacts`; pass `--private` when
-creating a private repository. Existing artifacts are validated and reused
-unless `--force` is supplied.
+by default at
+[`Yuvrajxms09/klein-torchao-artifacts`](https://huggingface.co/Yuvrajxms09/klein-torchao-artifacts);
+pass `--private` when creating a private repository. Existing artifacts are
+validated and reused unless `--force` is supplied.
 
 Then run the separate pre-quantized benchmark. It downloads the transformer and
 text encoder from the validated `Yuvrajxms09/klein-torchao-artifacts` commit;
